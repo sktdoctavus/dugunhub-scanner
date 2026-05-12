@@ -60,18 +60,18 @@ function compareFingerprints(queryFp, songFp) {
 }
 
 // Download a specific time segment of a YouTube video as audio, return temp file path
+// Uses native format (webm/opus) — no conversion, fpcalc decodes it directly via libavcodec
 async function downloadSegment(videoUrl, startSec, durationSec, tmpDir) {
-  const outPath = path.join(tmpDir, `seg_${startSec}.mp3`);
+  // Use %(ext)s so yt-dlp keeps the native extension (webm, m4a, etc.)
+  const outTemplate = path.join(tmpDir, `seg_${startSec}.%(ext)s`);
   const args = [
     "--no-playlist",
-    "--extract-audio",
-    "--audio-format", "mp3",
-    "--audio-quality", "0",
+    "-x",
+    "--format", "bestaudio",
     "--download-sections", `*${startSec}-${startSec + durationSec}`,
-    "--force-keyframes-at-cuts",
     "--no-progress",
     "--js-runtimes", "node",
-    "-o", outPath,
+    "-o", outTemplate,
     videoUrl,
   ];
 
@@ -82,19 +82,19 @@ async function downloadSegment(videoUrl, startSec, durationSec, tmpDir) {
         console.error(`[yt-dlp] FAILED @${startSec}s: ${msg}`);
         reject(new Error(msg));
       } else {
-        if (stderr) console.log(`[yt-dlp] @${startSec}s stderr: ${stderr.slice(0, 300)}`);
+        if (stderr) console.log(`[yt-dlp] @${startSec}s ok. stderr: ${stderr.slice(0, 200)}`);
         resolve();
       }
     });
   });
 
-  // yt-dlp sometimes saves with a different filename — check and fall back to glob
-  if (!fs.existsSync(outPath)) {
-    const files = fs.readdirSync(tmpDir).filter((f) => f.startsWith(`seg_${startSec}`) && f.endsWith(".mp3"));
-    if (files.length > 0) return path.join(tmpDir, files[0]);
-    throw new Error(`yt-dlp exited 0 but output file not found at ${outPath}`);
+  // Find the actual output file (extension varies: webm, m4a, opus, etc.)
+  const files = fs.readdirSync(tmpDir).filter((f) => f.startsWith(`seg_${startSec}.`));
+  if (files.length === 0) {
+    throw new Error(`yt-dlp exited 0 but no output file found for seg_${startSec}`);
   }
-
+  const outPath = path.join(tmpDir, files[0]);
+  console.log(`[yt-dlp] @${startSec}s saved: ${files[0]} (${fs.statSync(outPath).size} bytes)`);
   return outPath;
 }
 
