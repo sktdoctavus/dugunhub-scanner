@@ -201,4 +201,65 @@ async function processJob(jobId) {
   }
 }
 
-module.exports = { processJob, resolveYouTubeUrl };
+// Extract and store fingerprint for a danger_song entry
+// source: { type: "youtube", url } | { type: "storage_path", path }
+async function fingerprintDangerSong(songId) {
+  const { data: song, error } = await supabase
+    .from("danger_songs")
+    .select("id, title, notes, submission_id")
+    .eq("id", songId)
+    .single();
+  if (error || !song) throw new Error(`Song not found: ${error?.message}`);
+
+  // Derive source: prefer YouTube URL from notes, fallback to submission audio_url
+  let youtubeUrl = null;
+  if (song.notes) {
+    const match = song.notes.match(/YouTube:\s*(https?:\/\/\S+)/);
+    if (match) youtubeUrl = match[1];
+  }
+
+  if (!youtubeUrl && song.submission_id) {
+    const { data: sub } = await supabase
+      .from("song_submissions")
+      .select("youtube_url, audio_url")
+      .eq("id", song.submission_id)
+      .single();
+    if (sub?.youtube_url) youtubeUrl = sub.youtube_url;
+  }
+
+  if (!youtubeUrl) throw new Error("No YouTube URL found for this song — upload an audio file or provide a YouTube link.");
+
+  // Download first 3 minutes of the song for a reliable fingerprint
+  const tmpDir = require("fs").mkdtempSync(require("path").join(require("os").tmpdir(), "dh-song-"));
+  const outPath = require("path").join(tmpDir, "song.mp3");
+  try {
+    const { exec } = require("child_process");
+    await new Promise((resolve, reject) => {
+      const cmd = [
+        "yt-dlp", "--no-playlist", "--extract-audio",
+        "--audio-format mp3", "--audio-quality 5",
+        `--download-sections "*0-180"`,
+        "-o", `"${outPath}"`,
+        `"${youtubeUrl}"`,
+      ].join(" ");
+      exec(cmd, { timeout: 120000 }, (err, _, stderr) => {
+        if (err) reject(new Error(stderr || err.message));
+        else resolve();
+      });
+    });
+
+    const { getFingerprintFromFile } = require("./fingerprint");
+    const { fingerprint } = getFingerprintFromFile(outPath);
+
+    await supabase.from("danger_songs").update({
+      fingerprint,
+      approved_at: new Date().toISOString(),
+    }).eq("id", songId);
+
+    return { success: true, fingerprintLength: fingerprint.length };
+  } finally {
+    try { require("fs").rmSync(tmpDir, { recursive: true }); } catch {}
+  }
+}
+
+module.exports = { processJob, resolveYouTubeUrl, fingerprintDangerSong };

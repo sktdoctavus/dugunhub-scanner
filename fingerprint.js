@@ -34,12 +34,29 @@ function bitErrorRate(fp1, fp2) {
   return errors / (len * 32);
 }
 
-// Compare a query fingerprint (from a video segment) against a stored song fingerprint
-// Returns match score 0-1 (1 = identical)
+// Compare a short query fingerprint (video segment) against a longer song fingerprint
+// using a sliding window so the match works regardless of where in the song the clip appears.
+// Returns the best match score 0-1 (1 = identical)
 function compareFingerprints(queryFp, songFp) {
   if (!queryFp?.length || !songFp?.length) return 0;
-  const ber = bitErrorRate(queryFp, songFp);
-  return Math.max(0, 1 - ber / 0.35); // normalize: 1=perfect match, 0=no match
+
+  // If song fingerprint is shorter than query, just do direct comparison
+  if (songFp.length <= queryFp.length) {
+    const ber = bitErrorRate(queryFp, songFp);
+    return Math.max(0, 1 - ber / 0.35);
+  }
+
+  // Slide query over song fingerprint in steps of ~5 seconds (10 ints)
+  const step = Math.max(1, Math.floor(queryFp.length / 3));
+  let best = 0;
+  for (let offset = 0; offset <= songFp.length - queryFp.length; offset += step) {
+    const window = songFp.slice(offset, offset + queryFp.length);
+    const ber = bitErrorRate(queryFp, window);
+    const score = Math.max(0, 1 - ber / 0.35);
+    if (score > best) best = score;
+    if (best >= 0.9) break; // good enough, stop early
+  }
+  return best;
 }
 
 // Download a specific time segment of a YouTube video as audio, return temp file path

@@ -1,5 +1,5 @@
 const express = require("express");
-const { processJob, resolveYouTubeUrl } = require("./scanner");
+const { processJob, resolveYouTubeUrl, fingerprintDangerSong } = require("./scanner");
 const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
@@ -43,6 +43,23 @@ app.post("/preview", auth, async (req, res) => {
   } catch (e) {
     res.status(400).json({ error: e.message });
   }
+});
+
+// Extract fingerprint for a danger_song — fire-and-forget, updates DB when done
+app.post("/fingerprint-song", auth, async (req, res) => {
+  const { songId } = req.body;
+  if (!songId) return res.status(400).json({ error: "songId required" });
+
+  res.json({ status: "accepted", songId });
+
+  fingerprintDangerSong(songId).catch((e) => {
+    console.error(`Fingerprint job for ${songId} failed:`, e.message);
+    // Mark fingerprint as failed via a sentinel value so admin knows
+    supabase.from("danger_songs")
+      .update({ notes: `Fingerprint error: ${e.message}` })
+      .eq("id", songId)
+      .then(() => {});
+  });
 });
 
 // Start a scan job — job must already exist in Supabase scan_jobs table
