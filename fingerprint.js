@@ -71,9 +71,16 @@ async function downloadSegment(videoUrl, startSec, durationSec, tmpDir) {
     "--download-sections", `*${startSec}-${startSec + durationSec}`,
     "--no-progress",
     "--js-runtimes", "node",
+    // Pretend to be the YouTube iOS app — avoids bot detection on datacenter IPs
+    "--extractor-args", "youtube:player_client=ios",
   ];
 
-  // Use cookies if available (needed for Railway IPs blocked by YouTube bot detection)
+  // Optional: residential proxy via YTDLP_PROXY env var (e.g. http://user:pass@host:port)
+  if (process.env.YTDLP_PROXY) {
+    args.push("--proxy", process.env.YTDLP_PROXY);
+  }
+
+  // Optional: cookie file via YOUTUBE_COOKIES env var (last-resort fallback)
   const cookiesPath = "/tmp/yt-cookies.txt";
   if (fs.existsSync(cookiesPath)) {
     args.push("--cookies", cookiesPath);
