@@ -74,7 +74,7 @@ async function downloadSegment(videoUrl, startSec, durationSec, tmpDir) {
     "--download-sections", `*${startSec}-${startSec + durationSec}`,
     "--no-progress",
     "--js-runtimes", "node",
-    "--extractor-args", "youtube:player_client=tv_embedded,android",
+    "--extractor-args", "youtube:player_client=tv_embedded,web_embedded,android_vr,android",
   ];
 
   if (process.env.YTDLP_PROXY) {
