@@ -70,6 +70,7 @@ async function downloadSegment(videoUrl, startSec, durationSec, tmpDir) {
     "--download-sections", `*${startSec}-${startSec + durationSec}`,
     "--force-keyframes-at-cuts",
     "--no-progress",
+    "--js-runtimes", "node",
     "-o", outPath,
     videoUrl,
   ];
