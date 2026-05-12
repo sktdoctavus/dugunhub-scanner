@@ -3,29 +3,8 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 
-// Fingerprint a raw s16le PCM file directly, bypassing any container parsing.
-// fpcalc supports raw audio input via -format/-rate/-channels flags, so no WAV
-// wrapper is needed. This avoids all RIFF/container-related EOF decode failures.
-function getFingerprintFromPcm(pcmPath, sampleRate = 22050, channels = 1) {
-  const result = spawnSync("fpcalc", [
-    "-raw", "-json",
-    "-format", "s16le",
-    "-rate", String(sampleRate),
-    "-channels", String(channels),
-    pcmPath,
-  ], { timeout: 60000, encoding: "utf8" });
-
-  if (result.status !== 0 || !result.stdout?.trim()) {
-    const detail = (result.stderr || result.error?.message || "no output").slice(0, 600);
-    throw new Error(`fpcalc exit ${result.status}: ${detail}`);
-  }
-
-  const parsed = JSON.parse(result.stdout);
-  return { fingerprint: parsed.fingerprint, duration: parsed.duration };
-}
-
-// Generate chromaprint fingerprint for a decoded audio file (WAV, MP3, FLAC, etc.)
-// Returns array of integers (the fingerprint) and duration in seconds
+// Generate chromaprint fingerprint for an audio file (WAV, FLAC, MP3, etc.)
+// Returns { fingerprint: int[], duration }
 function getFingerprintFromFile(audioPath) {
   const result = spawnSync("fpcalc", ["-raw", "-json", audioPath], {
     timeout: 60000,
@@ -40,7 +19,6 @@ function getFingerprintFromFile(audioPath) {
 }
 
 // Bit error rate between two fingerprint arrays (lower = more similar)
-// < 0.35 is considered a match
 function bitErrorRate(fp1, fp2) {
   const len = Math.min(fp1.length, fp2.length);
   if (len === 0) return 1;
@@ -55,9 +33,8 @@ function bitErrorRate(fp1, fp2) {
   return errors / (len * 32);
 }
 
-// Compare a short query fingerprint (video segment) against a longer song fingerprint
-// using a sliding window so the match works regardless of where in the song the clip appears.
-// Returns the best match score 0-1 (1 = identical)
+// Compare a short query fingerprint against a longer song fingerprint using a sliding
+// window. Returns the best match score 0-1 (1 = identical).
 function compareFingerprints(queryFp, songFp) {
   if (!queryFp?.length || !songFp?.length) return 0;
 
@@ -78,8 +55,18 @@ function compareFingerprints(queryFp, songFp) {
   return best;
 }
 
-// Download a specific time segment of a YouTube video as audio.
-// Returns the path to a raw s16le PCM temp file (caller must delete it).
+// Download a YouTube audio segment and return the path to a FLAC temp file.
+//
+// yt-dlp --download-sections produces truncated opus/webm containers (the stream is
+// cut without a proper end-of-stream marker). WAV and raw-PCM output from such files
+// cause fpcalc to exit 3 ("Error decoding audio frame / End of file") regardless of
+// how the WAV header is constructed, because libchromaprint's internal libav parser
+// hits the EOF condition differently for those formats.
+//
+// FLAC is self-framing: each frame carries its own sync word and sample count, so
+// the decoder never relies on a pre-declared total size. ffmpeg properly closes the
+// FLAC STREAMINFO after flushing the decoder, giving fpcalc a valid, complete file
+// even when the source container was truncated.
 async function downloadSegment(videoUrl, startSec, durationSec, tmpDir) {
   const outTemplate = path.join(tmpDir, `seg_${startSec}.%(ext)s`);
 
@@ -92,11 +79,7 @@ async function downloadSegment(videoUrl, startSec, durationSec, tmpDir) {
     "--js-runtimes", "node",
     "--extractor-args", "youtube:player_client=tv_embedded,web_embedded,android_vr,android",
   ];
-
-  if (process.env.YTDLP_PROXY) {
-    args.push("--proxy", process.env.YTDLP_PROXY);
-  }
-
+  if (process.env.YTDLP_PROXY) args.push("--proxy", process.env.YTDLP_PROXY);
   args.push("-o", outTemplate, videoUrl);
 
   await new Promise((resolve, reject) => {
@@ -113,45 +96,38 @@ async function downloadSegment(videoUrl, startSec, durationSec, tmpDir) {
   });
 
   const files = fs.readdirSync(tmpDir).filter((f) => f.startsWith(`seg_${startSec}.`));
-  if (files.length === 0) {
-    throw new Error(`yt-dlp exited 0 but no output file found for seg_${startSec}`);
-  }
+  if (files.length === 0) throw new Error(`yt-dlp produced no output for seg_${startSec}`);
   const rawPath = path.join(tmpDir, files[0]);
   console.log(`[yt-dlp] @${startSec}s saved: ${files[0]} (${fs.statSync(rawPath).size} bytes)`);
 
-  // Decode to raw s16le PCM. yt-dlp --download-sections produces truncated opus/webm
-  // containers (no end-of-stream marker), so the container has a structural EOF.
-  // -err_detect ignore_err lets ffmpeg decode all available frames despite the truncation.
-  // Raw PCM output has no container header, so there is nothing for fpcalc to mis-parse.
-  const pcmPath = path.join(tmpDir, `seg_${startSec}.pcm`);
+  const flacPath = path.join(tmpDir, `seg_${startSec}.flac`);
   await new Promise((resolve, reject) => {
     execFile("ffmpeg", [
       "-err_detect", "ignore_err",
       "-i", rawPath,
       "-ac", "1",
       "-ar", "22050",
-      "-f", "s16le",
-      "-y", pcmPath,
+      "-c:a", "flac",
+      "-y", flacPath,
     ], { timeout: 30000 }, (err, stdout, stderr) => {
       if (err) {
         console.error(`[ffmpeg] @${startSec}s failed: ${(stderr || err.message).slice(0, 300)}`);
         reject(new Error(stderr || err.message));
       } else {
-        const size = fs.existsSync(pcmPath) ? fs.statSync(pcmPath).size : 0;
-        console.log(`[ffmpeg] @${startSec}s → pcm (${size} bytes)`);
-        if (size === 0) reject(new Error("ffmpeg produced empty PCM file"));
+        const size = fs.existsSync(flacPath) ? fs.statSync(flacPath).size : 0;
+        console.log(`[ffmpeg] @${startSec}s → flac (${size} bytes)`);
+        if (size === 0) reject(new Error("ffmpeg produced empty FLAC"));
         else resolve();
       }
     });
   });
 
   fs.unlinkSync(rawPath);
-  return pcmPath;
+  return flacPath;
 }
 
-// Extract audio fingerprints from a YouTube video by sampling every intervalSec seconds
-// Each sample is sampleDurationSec long
-// Returns array of { startSec, fingerprint }
+// Extract audio fingerprints from a YouTube video by sampling every intervalSec seconds.
+// Returns array of { startSec, fingerprint }.
 async function fingerprintVideo(videoUrl, videoDurationSec, options = {}) {
   const intervalSec = options.intervalSec || 180;
   const sampleDurationSec = options.sampleDurationSec || 30;
@@ -166,7 +142,7 @@ async function fingerprintVideo(videoUrl, videoDurationSec, options = {}) {
       let audioPath;
       try {
         audioPath = await downloadSegment(videoUrl, start, end - start, tmpDir);
-        const { fingerprint } = getFingerprintFromPcm(audioPath);
+        const { fingerprint } = getFingerprintFromFile(audioPath);
         console.log(`[fp] sample @${start}s: ${fingerprint.length} ints`);
         samples.push({ startSec: start, fingerprint });
       } catch (e) {
