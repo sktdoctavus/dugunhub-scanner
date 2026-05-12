@@ -71,9 +71,15 @@ async function downloadSegment(videoUrl, startSec, durationSec, tmpDir) {
     "--download-sections", `*${startSec}-${startSec + durationSec}`,
     "--no-progress",
     "--js-runtimes", "node",
-    "-o", outTemplate,
-    videoUrl,
   ];
+
+  // Use cookies if available (needed for Railway IPs blocked by YouTube bot detection)
+  const cookiesPath = "/tmp/yt-cookies.txt";
+  if (fs.existsSync(cookiesPath)) {
+    args.push("--cookies", cookiesPath);
+  }
+
+  args.push("-o", outTemplate, videoUrl);
 
   await new Promise((resolve, reject) => {
     execFile("yt-dlp", args, { timeout: 120000 }, (err, stdout, stderr) => {
