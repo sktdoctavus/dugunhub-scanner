@@ -1,21 +1,48 @@
-const { execSync, exec, execFile } = require("child_process");
+const { execFile, spawnSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
 
+// Write a minimal, spec-compliant 44-byte WAV header + raw s16le PCM into wavPath.
+// Avoids any ffmpeg WAV muxer quirks (e.g. JUNK alignment chunks that confuse
+// libchromaprint's internal parser and cause "End of file" decode failures).
+function writePcmAsWav(pcmPath, wavPath, sampleRate = 22050, channels = 1) {
+  const pcm = fs.readFileSync(pcmPath);
+  const buf = Buffer.alloc(44 + pcm.length);
+  const byteRate = sampleRate * channels * 2;
+  buf.write("RIFF", 0);
+  buf.writeUInt32LE(36 + pcm.length, 4);
+  buf.write("WAVE", 8);
+  buf.write("fmt ", 12);
+  buf.writeUInt32LE(16, 16);        // PCM fmt chunk is always 16 bytes
+  buf.writeUInt16LE(1, 20);         // PCM format
+  buf.writeUInt16LE(channels, 22);
+  buf.writeUInt32LE(sampleRate, 24);
+  buf.writeUInt32LE(byteRate, 28);
+  buf.writeUInt16LE(channels * 2, 32); // block align
+  buf.writeUInt16LE(16, 34);           // bits per sample
+  buf.write("data", 36);
+  buf.writeUInt32LE(pcm.length, 40);
+  pcm.copy(buf, 44);
+  fs.writeFileSync(wavPath, buf);
+}
+
 // Generate chromaprint fingerprint for an audio file using fpcalc
 // Returns array of integers (the fingerprint) and duration in seconds
 function getFingerprintFromFile(audioPath) {
-  try {
-    const out = execSync(`fpcalc -raw -json "${audioPath}"`, { timeout: 60000 }).toString();
-    const parsed = JSON.parse(out);
-    return {
-      fingerprint: parsed.fingerprint, // int[]
-      duration: parsed.duration,
-    };
-  } catch (e) {
-    throw new Error(`fpcalc failed: ${e.message}`);
+  const result = spawnSync("fpcalc", ["-raw", "-json", audioPath], {
+    timeout: 60000,
+    encoding: "utf8",
+  });
+  if (result.status !== 0 || !result.stdout?.trim()) {
+    const detail = (result.stderr || result.error?.message || "no output").slice(0, 600);
+    throw new Error(`fpcalc exit ${result.status}: ${detail}`);
   }
+  const parsed = JSON.parse(result.stdout);
+  return {
+    fingerprint: parsed.fingerprint, // int[]
+    duration: parsed.duration,
+  };
 }
 
 // Bit error rate between two fingerprint arrays (lower = more similar)
@@ -59,14 +86,10 @@ function compareFingerprints(queryFp, songFp) {
   return best;
 }
 
-// Download a specific time segment of a YouTube video as audio, return temp file path
-// Uses native format (webm/opus) — no conversion, fpcalc decodes it directly via libavcodec
+// Download a specific time segment of a YouTube video as audio, return temp WAV file path.
 async function downloadSegment(videoUrl, startSec, durationSec, tmpDir) {
-  // Use %(ext)s so yt-dlp keeps the native extension (webm, m4a, etc.)
   const outTemplate = path.join(tmpDir, `seg_${startSec}.%(ext)s`);
 
-  // tv_embedded uses YouTube's whitelisted embedded-player API — far less bot detection
-  // than web/ios. android is the fallback when tv_embedded lacks a format.
   const args = [
     "--no-playlist",
     "-x",
@@ -104,15 +127,15 @@ async function downloadSegment(videoUrl, startSec, durationSec, tmpDir) {
   const rawPath = path.join(tmpDir, files[0]);
   console.log(`[yt-dlp] @${startSec}s saved: ${files[0]} (${fs.statSync(rawPath).size} bytes)`);
 
-  // Two-pass conversion to work around truncated opus/webm containers from yt-dlp
-  // --download-sections. The truncation causes the WAV RIFF header to claim more data
-  // than was actually decoded (ffmpeg writes the expected size upfront, then decodes
-  // fewer samples). fpcalc's strict internal decoder hits the EOF mismatch and fails.
+  // Two-pass audio pipeline to handle truncated opus/webm from yt-dlp --download-sections:
   //
-  // Pass 1: decode to raw s16le PCM — no container = no size metadata written upfront,
-  //         so truncation only means fewer bytes, not a corrupt header.
-  // Pass 2: wrap the raw PCM into WAV — ffmpeg reads exact byte count and writes a
-  //         correct RIFF header that matches the actual data length.
+  // Pass 1 (ffmpeg): decode to raw s16le PCM with error tolerance. Raw PCM has no
+  //   container header, so truncation = fewer bytes, not a corrupt size field.
+  //
+  // Pass 2 (Node.js): write a hand-crafted minimal 44-byte WAV header. ffmpeg's WAV
+  //   muxer adds a JUNK alignment chunk that confuses libchromaprint's internal RIFF
+  //   parser, causing "Error decoding audio frame / End of file" even on valid PCM.
+  //   Building the header manually guarantees fmt + data chunks only, exact sizes.
   const pcmPath = path.join(tmpDir, `seg_${startSec}.pcm`);
   const wavPath = path.join(tmpDir, `seg_${startSec}.wav`);
 
@@ -137,25 +160,9 @@ async function downloadSegment(videoUrl, startSec, durationSec, tmpDir) {
     });
   });
 
-  await new Promise((resolve, reject) => {
-    execFile("ffmpeg", [
-      "-f", "s16le",
-      "-ar", "22050",
-      "-ac", "1",
-      "-i", pcmPath,
-      "-y", wavPath,
-    ], { timeout: 15000 }, (err, stdout, stderr) => {
-      if (err) {
-        console.error(`[ffmpeg/wav] @${startSec}s failed: ${(stderr || err.message).slice(0, 300)}`);
-        reject(new Error(stderr || err.message));
-      } else {
-        const size = fs.existsSync(wavPath) ? fs.statSync(wavPath).size : 0;
-        console.log(`[ffmpeg/wav] @${startSec}s → wav (${size} bytes)`);
-        if (size === 0) reject(new Error("ffmpeg produced empty WAV file"));
-        else resolve();
-      }
-    });
-  });
+  writePcmAsWav(pcmPath, wavPath);
+  const wavSize = fs.statSync(wavPath).size;
+  console.log(`[wav] @${startSec}s → wav (${wavSize} bytes)`);
 
   fs.unlinkSync(rawPath);
   fs.unlinkSync(pcmPath);
@@ -183,15 +190,14 @@ async function fingerprintVideo(videoUrl, videoDurationSec, options = {}) {
         console.log(`[fp] sample @${start}s: ${fingerprint.length} ints`);
         samples.push({ startSec: start, fingerprint });
       } catch (e) {
-        console.error(`[fp] sample @${start}s FAILED: ${e.message.slice(0, 300)}`);
+        console.error(`[fp] sample @${start}s FAILED: ${e.message.slice(0, 500)}`);
         samples.push({ startSec: start, fingerprint: null, error: e.message });
       } finally {
         if (audioPath && fs.existsSync(audioPath)) fs.unlinkSync(audioPath);
       }
     }
   } finally {
-    // Cleanup temp dir
-    try { fs.rmdirSync(tmpDir, { recursive: true }); } catch {}
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
   }
 
   return samples;
