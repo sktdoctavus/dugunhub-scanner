@@ -250,7 +250,9 @@ async function fingerprintDangerSong(songId) {
     await setNote(`downloaded ${buf.length} bytes, running fpcalc`);
     fs.writeFileSync(audioPath, buf);
 
-    const { fingerprint } = getFingerprintFromFile(audioPath);
+    const { fingerprint: rawFp } = getFingerprintFromFile(audioPath);
+    // fpcalc outputs unsigned 32-bit ints; PostgreSQL integer[] is signed — reinterpret
+    const fingerprint = rawFp.map((v) => (v > 2147483647 ? v - 4294967296 : v));
     await setNote(`fpcalc done, fp length ${fingerprint.length}, saving`);
 
     const { error: updateErr } = await supabase.from("danger_songs").update({
