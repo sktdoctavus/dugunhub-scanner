@@ -64,6 +64,9 @@ function compareFingerprints(queryFp, songFp) {
 async function downloadSegment(videoUrl, startSec, durationSec, tmpDir) {
   // Use %(ext)s so yt-dlp keeps the native extension (webm, m4a, etc.)
   const outTemplate = path.join(tmpDir, `seg_${startSec}.%(ext)s`);
+  const cookiesPath = "/tmp/yt-cookies.txt";
+  const hasCookies = fs.existsSync(cookiesPath);
+
   const args = [
     "--no-playlist",
     "-x",
@@ -71,19 +74,18 @@ async function downloadSegment(videoUrl, startSec, durationSec, tmpDir) {
     "--download-sections", `*${startSec}-${startSec + durationSec}`,
     "--no-progress",
     "--js-runtimes", "node",
-    // Pretend to be the YouTube iOS app — avoids bot detection on datacenter IPs
-    "--extractor-args", "youtube:player_client=ios",
   ];
 
-  // Optional: residential proxy via YTDLP_PROXY env var (e.g. http://user:pass@host:port)
-  if (process.env.YTDLP_PROXY) {
-    args.push("--proxy", process.env.YTDLP_PROXY);
+  if (hasCookies) {
+    // Cookies present: use default web client (ios doesn't support cookies)
+    args.push("--cookies", cookiesPath);
+  } else {
+    // No cookies: pretend to be iOS app to bypass bot detection
+    args.push("--extractor-args", "youtube:player_client=ios");
   }
 
-  // Optional: cookie file via YOUTUBE_COOKIES env var (last-resort fallback)
-  const cookiesPath = "/tmp/yt-cookies.txt";
-  if (fs.existsSync(cookiesPath)) {
-    args.push("--cookies", cookiesPath);
+  if (process.env.YTDLP_PROXY) {
+    args.push("--proxy", process.env.YTDLP_PROXY);
   }
 
   args.push("-o", outTemplate, videoUrl);
