@@ -155,13 +155,18 @@ async function processJob(jobId) {
     for (let i = 0; i < videos.length; i++) {
       const video = videos[i];
 
-      // Update progress
+      // Show which video is currently being processed
       await supabase.from("scan_jobs").update({
-        progress_video: i + 1,
         progress_title: video.title,
       }).eq("id", jobId);
 
       const result = await processVideo(video, dangerSongs);
+
+      // Update progress count after video is done
+      await supabase.from("scan_jobs").update({
+        progress_video: i + 1,
+      }).eq("id", jobId);
+
       results.push({
         video_id: video.id,
         video_title: video.title,
