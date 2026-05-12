@@ -201,9 +201,23 @@ async function processJob(jobId) {
   }
 }
 
+// Write YouTube cookies from env var to a temp file (base64-encoded Netscape cookies.txt)
+function getCookiesFile(tmpDir) {
+  const b64 = process.env.YOUTUBE_COOKIES_B64;
+  if (!b64) return null;
+  const cookiePath = require("path").join(tmpDir, "cookies.txt");
+  require("fs").writeFileSync(cookiePath, Buffer.from(b64, "base64").toString("utf8"));
+  return cookiePath;
+}
+
 // Extract and store fingerprint for a danger_song entry
-// source: { type: "youtube", url } | { type: "storage_path", path }
 async function fingerprintDangerSong(songId) {
+  const fs = require("fs");
+  const path = require("path");
+  const os = require("os");
+  const { exec } = require("child_process");
+  const { getFingerprintFromFile } = require("./fingerprint");
+
   const { data: song, error } = await supabase
     .from("danger_songs")
     .select("id, title, notes, submission_id")
@@ -211,54 +225,78 @@ async function fingerprintDangerSong(songId) {
     .single();
   if (error || !song) throw new Error(`Song not found: ${error?.message}`);
 
-  // Derive source: prefer YouTube URL from notes, fallback to submission audio_url
+  // Load submission to get audio_url and youtube_url
+  let audioStoragePath = null;
   let youtubeUrl = null;
-  if (song.notes) {
-    const match = song.notes.match(/YouTube:\s*(https?:\/\/\S+)/);
-    if (match) youtubeUrl = match[1];
-  }
 
-  if (!youtubeUrl && song.submission_id) {
+  if (song.submission_id) {
     const { data: sub } = await supabase
       .from("song_submissions")
       .select("youtube_url, audio_url")
       .eq("id", song.submission_id)
       .single();
+    if (sub?.audio_url) audioStoragePath = sub.audio_url;
     if (sub?.youtube_url) youtubeUrl = sub.youtube_url;
   }
 
-  if (!youtubeUrl) throw new Error("No YouTube URL found for this song — upload an audio file or provide a YouTube link.");
+  // Also check notes for YouTube URL (legacy)
+  if (!youtubeUrl && song.notes) {
+    const match = song.notes.match(/YouTube:\s*(https?:\/\/\S+)/);
+    if (match) youtubeUrl = match[1];
+  }
 
-  // Download first 3 minutes of the song for a reliable fingerprint
-  const tmpDir = require("fs").mkdtempSync(require("path").join(require("os").tmpdir(), "dh-song-"));
-  const outPath = require("path").join(tmpDir, "song.mp3");
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "dh-song-"));
   try {
-    const { exec } = require("child_process");
-    await new Promise((resolve, reject) => {
+    let audioPath = null;
+
+    // Prefer uploaded audio file — no YouTube rate limiting
+    if (audioStoragePath) {
+      const { data: signed, error: signErr } = await supabase.storage
+        .from("song-submissions")
+        .createSignedUrl(audioStoragePath, 300);
+      if (signErr) throw new Error(`Storage signed URL failed: ${signErr.message}`);
+
+      const res = await fetch(signed.signedUrl);
+      if (!res.ok) throw new Error(`Storage download failed: ${res.status}`);
+      const buf = Buffer.from(await res.arrayBuffer());
+      audioPath = path.join(tmpDir, "song.mp3");
+      fs.writeFileSync(audioPath, buf);
+
+    } else if (youtubeUrl) {
+      // Fall back to YouTube — use cookies if available to bypass bot check
+      audioPath = path.join(tmpDir, "song.mp3");
+      const cookiesFile = getCookiesFile(tmpDir);
+      const cookiesArg = cookiesFile ? `--cookies "${cookiesFile}"` : "";
       const cmd = [
         "yt-dlp", "--no-playlist", "--extract-audio",
         "--audio-format mp3", "--audio-quality 5",
         `--download-sections "*0-180"`,
-        "-o", `"${outPath}"`,
+        cookiesArg,
+        "-o", `"${audioPath}"`,
         `"${youtubeUrl}"`,
-      ].join(" ");
-      exec(cmd, { timeout: 120000 }, (err, _, stderr) => {
-        if (err) reject(new Error(stderr || err.message));
-        else resolve();
+      ].filter(Boolean).join(" ");
+
+      await new Promise((resolve, reject) => {
+        exec(cmd, { timeout: 180000 }, (err, _, stderr) => {
+          if (err) reject(new Error(stderr || err.message));
+          else resolve();
+        });
       });
-    });
 
-    const { getFingerprintFromFile } = require("./fingerprint");
-    const { fingerprint } = getFingerprintFromFile(outPath);
+    } else {
+      throw new Error("No audio source available. Upload an audio file or provide a YouTube link.");
+    }
 
+    const { fingerprint } = getFingerprintFromFile(audioPath);
     await supabase.from("danger_songs").update({
       fingerprint,
       approved_at: new Date().toISOString(),
+      notes: youtubeUrl && !audioStoragePath ? `YouTube: ${youtubeUrl}` : song.notes,
     }).eq("id", songId);
 
     return { success: true, fingerprintLength: fingerprint.length };
   } finally {
-    try { require("fs").rmSync(tmpDir, { recursive: true }); } catch {}
+    try { fs.rmSync(tmpDir, { recursive: true }); } catch {}
   }
 }
 
