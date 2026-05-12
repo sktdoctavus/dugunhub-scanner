@@ -77,8 +77,10 @@ async function downloadSegment(videoUrl, startSec, durationSec, tmpDir) {
   ];
 
   if (hasCookies) {
-    // Cookies present: use default web client (ios doesn't support cookies)
+    // Cookies present: force web client explicitly so yt-dlp never tries ios
+    // (ios is in yt-dlp's default rotation and gets skipped with cookies, leaving only image formats)
     args.push("--cookies", cookiesPath);
+    args.push("--extractor-args", "youtube:player_client=web");
   } else {
     // No cookies: pretend to be iOS app to bypass bot detection
     args.push("--extractor-args", "youtube:player_client=ios");
