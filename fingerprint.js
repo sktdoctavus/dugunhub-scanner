@@ -104,26 +104,53 @@ async function downloadSegment(videoUrl, startSec, durationSec, tmpDir) {
   const rawPath = path.join(tmpDir, files[0]);
   console.log(`[yt-dlp] @${startSec}s saved: ${files[0]} (${fs.statSync(rawPath).size} bytes)`);
 
-  // Convert to WAV — yt-dlp --download-sections can leave opus/webm containers incomplete
-  // (missing end-of-stream marker), causing fpcalc to fail. ffmpeg with -err_detect
-  // ignore_err tolerates the truncated end and produces a clean decodable WAV.
+  // Two-pass conversion to work around truncated opus/webm containers from yt-dlp
+  // --download-sections. The truncation causes the WAV RIFF header to claim more data
+  // than was actually decoded (ffmpeg writes the expected size upfront, then decodes
+  // fewer samples). fpcalc's strict internal decoder hits the EOF mismatch and fails.
+  //
+  // Pass 1: decode to raw s16le PCM — no container = no size metadata written upfront,
+  //         so truncation only means fewer bytes, not a corrupt header.
+  // Pass 2: wrap the raw PCM into WAV — ffmpeg reads exact byte count and writes a
+  //         correct RIFF header that matches the actual data length.
+  const pcmPath = path.join(tmpDir, `seg_${startSec}.pcm`);
   const wavPath = path.join(tmpDir, `seg_${startSec}.wav`);
+
   await new Promise((resolve, reject) => {
     execFile("ffmpeg", [
       "-err_detect", "ignore_err",
       "-i", rawPath,
       "-ac", "1",
       "-ar", "22050",
-      "-acodec", "pcm_s16le",
-      "-f", "wav",
-      "-y", wavPath,
+      "-f", "s16le",
+      "-y", pcmPath,
     ], { timeout: 30000 }, (err, stdout, stderr) => {
       if (err) {
-        console.error(`[ffmpeg] @${startSec}s failed: ${(stderr || err.message).slice(0, 200)}`);
+        console.error(`[ffmpeg/pcm] @${startSec}s failed: ${(stderr || err.message).slice(0, 300)}`);
+        reject(new Error(stderr || err.message));
+      } else {
+        const size = fs.existsSync(pcmPath) ? fs.statSync(pcmPath).size : 0;
+        console.log(`[ffmpeg/pcm] @${startSec}s → pcm (${size} bytes)`);
+        if (size === 0) reject(new Error("ffmpeg produced empty PCM file"));
+        else resolve();
+      }
+    });
+  });
+
+  await new Promise((resolve, reject) => {
+    execFile("ffmpeg", [
+      "-f", "s16le",
+      "-ar", "22050",
+      "-ac", "1",
+      "-i", pcmPath,
+      "-y", wavPath,
+    ], { timeout: 15000 }, (err, stdout, stderr) => {
+      if (err) {
+        console.error(`[ffmpeg/wav] @${startSec}s failed: ${(stderr || err.message).slice(0, 300)}`);
         reject(new Error(stderr || err.message));
       } else {
         const size = fs.existsSync(wavPath) ? fs.statSync(wavPath).size : 0;
-        console.log(`[ffmpeg] @${startSec}s → wav (${size} bytes)`);
+        console.log(`[ffmpeg/wav] @${startSec}s → wav (${size} bytes)`);
         if (size === 0) reject(new Error("ffmpeg produced empty WAV file"));
         else resolve();
       }
@@ -131,6 +158,7 @@ async function downloadSegment(videoUrl, startSec, durationSec, tmpDir) {
   });
 
   fs.unlinkSync(rawPath);
+  fs.unlinkSync(pcmPath);
   return wavPath;
 }
 
