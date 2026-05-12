@@ -253,11 +253,12 @@ async function fingerprintDangerSong(songId) {
     const { fingerprint } = getFingerprintFromFile(audioPath);
     await setNote(`fpcalc done, fp length ${fingerprint.length}, saving`);
 
-    await supabase.from("danger_songs").update({
+    const { error: updateErr } = await supabase.from("danger_songs").update({
       fingerprint,
       approved_at: new Date().toISOString(),
       notes: null,
     }).eq("id", songId);
+    if (updateErr) throw new Error(`DB update failed: ${updateErr.message} (code ${updateErr.code})`);
 
     return { success: true, fingerprintLength: fingerprint.length };
   } finally {
