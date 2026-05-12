@@ -209,14 +209,19 @@ async function fingerprintDangerSong(songId) {
   const os = require("os");
   const { getFingerprintFromFile } = require("./fingerprint");
 
+  const setNote = (msg) => supabase.from("danger_songs").update({ notes: `[fp] ${msg}` }).eq("id", songId).then(() => {});
+
+  await setNote("started");
+
   const { data: song, error } = await supabase
     .from("danger_songs")
     .select("id, title, submission_id")
     .eq("id", songId)
     .single();
   if (error || !song) throw new Error(`Song not found: ${error?.message}`);
-
   if (!song.submission_id) throw new Error("No submission linked to this song.");
+
+  await setNote("fetching submission");
 
   const { data: sub } = await supabase
     .from("song_submissions")
@@ -224,15 +229,16 @@ async function fingerprintDangerSong(songId) {
     .eq("id", song.submission_id)
     .single();
 
-  if (!sub?.audio_url) {
-    throw new Error("No audio file uploaded for this song. Ask the submitter to re-submit with an audio file attached.");
-  }
+  if (!sub?.audio_url) throw new Error("No audio file uploaded for this song.");
 
-  // Download from Supabase storage using a signed URL
+  await setNote(`signing url: ${sub.audio_url}`);
+
   const { data: signed, error: signErr } = await supabase.storage
     .from("song-submissions")
     .createSignedUrl(sub.audio_url, 300);
   if (signErr) throw new Error(`Storage URL failed: ${signErr.message}`);
+
+  await setNote("downloading audio");
 
   const res = await fetch(signed.signedUrl);
   if (!res.ok) throw new Error(`Storage download failed: ${res.status}`);
@@ -240,12 +246,17 @@ async function fingerprintDangerSong(songId) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "dh-song-"));
   try {
     const audioPath = path.join(tmpDir, "song.mp3");
-    fs.writeFileSync(audioPath, Buffer.from(await res.arrayBuffer()));
+    const buf = Buffer.from(await res.arrayBuffer());
+    await setNote(`downloaded ${buf.length} bytes, running fpcalc`);
+    fs.writeFileSync(audioPath, buf);
 
     const { fingerprint } = getFingerprintFromFile(audioPath);
+    await setNote(`fpcalc done, fp length ${fingerprint.length}, saving`);
+
     await supabase.from("danger_songs").update({
       fingerprint,
       approved_at: new Date().toISOString(),
+      notes: null,
     }).eq("id", songId);
 
     return { success: true, fingerprintLength: fingerprint.length };
