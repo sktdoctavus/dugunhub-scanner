@@ -114,6 +114,8 @@ async function downloadSegment(videoUrl, startSec, durationSec, tmpDir) {
       "-i", rawPath,
       "-ac", "1",
       "-ar", "22050",
+      "-acodec", "pcm_s16le",
+      "-f", "wav",
       "-y", wavPath,
     ], { timeout: 30000 }, (err, stdout, stderr) => {
       if (err) {
