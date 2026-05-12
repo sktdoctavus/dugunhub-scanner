@@ -1,19 +1,20 @@
 FROM node:20-slim
 
-# Install yt-dlp, ffmpeg, chromaprint (fpcalc)
-RUN apt-get update && apt-get install -y \
-    python3 \
-    python3-pip \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libchromaprint-tools \
     curl \
-    && pip3 install yt-dlp --break-system-packages \
-    && apt-get clean \
+    python3 \
     && rm -rf /var/lib/apt/lists/*
+
+# Download yt-dlp standalone binary (no pip/python3-pip needed)
+RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
+    -o /usr/local/bin/yt-dlp \
+    && chmod a+rx /usr/local/bin/yt-dlp
 
 WORKDIR /app
 
-COPY package*.json ./
+COPY package.json ./
 RUN npm install --omit=dev
 
 COPY . .
