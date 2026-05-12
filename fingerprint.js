@@ -110,9 +110,33 @@ async function downloadSegment(videoUrl, startSec, durationSec, tmpDir) {
   if (files.length === 0) {
     throw new Error(`yt-dlp exited 0 but no output file found for seg_${startSec}`);
   }
-  const outPath = path.join(tmpDir, files[0]);
-  console.log(`[yt-dlp] @${startSec}s saved: ${files[0]} (${fs.statSync(outPath).size} bytes)`);
-  return outPath;
+  const rawPath = path.join(tmpDir, files[0]);
+  console.log(`[yt-dlp] @${startSec}s saved: ${files[0]} (${fs.statSync(rawPath).size} bytes)`);
+
+  // Convert to WAV — yt-dlp --download-sections can leave opus/webm containers incomplete
+  // (missing end-of-stream marker), causing fpcalc to fail. ffmpeg with -err_detect
+  // ignore_err tolerates the truncated end and produces a clean decodable WAV.
+  const wavPath = path.join(tmpDir, `seg_${startSec}.wav`);
+  await new Promise((resolve, reject) => {
+    execFile("ffmpeg", [
+      "-err_detect", "ignore_err",
+      "-i", rawPath,
+      "-ac", "1",
+      "-ar", "22050",
+      "-y", wavPath,
+    ], { timeout: 30000 }, (err, stdout, stderr) => {
+      if (err) {
+        console.error(`[ffmpeg] @${startSec}s failed: ${(stderr || err.message).slice(0, 200)}`);
+        reject(new Error(stderr || err.message));
+      } else {
+        console.log(`[ffmpeg] @${startSec}s → wav (${fs.statSync(wavPath).size} bytes)`);
+        resolve();
+      }
+    });
+  });
+
+  fs.unlinkSync(rawPath);
+  return wavPath;
 }
 
 // Extract audio fingerprints from a YouTube video by sampling every intervalSec seconds
