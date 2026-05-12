@@ -9,7 +9,7 @@ const supabase = createClient(
 );
 
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
-const MATCH_THRESHOLD = 0.65; // score above this = match
+const MATCH_THRESHOLD = 0.3; // TEMP lowered for diagnostics (was 0.65)
 const DELAY_BETWEEN_VIDEOS_MS = 20000; // 20s delay between videos to avoid YouTube blocking
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 300000; // 5 minutes on block
@@ -274,4 +274,35 @@ async function fingerprintDangerSong(songId) {
   }
 }
 
-module.exports = { processJob, resolveYouTubeUrl, fingerprintDangerSong };
+// Debug: fingerprint one 30s clip from a URL and compare against all danger songs
+// Returns raw scores for diagnosis
+async function debugMatch(youtubeUrl, startSec = 0) {
+  const { fingerprintVideo } = require("./fingerprint");
+  const dangerSongs = await loadDangerSongs();
+
+  // Only download one sample starting at the given offset
+  const durationNeeded = startSec + 31;
+  const samples = await fingerprintVideo(youtubeUrl, durationNeeded, {
+    intervalSec: startSec === 0 ? 999999 : startSec,
+    sampleDurationSec: 30,
+  });
+
+  const validSamples = samples.filter((s) => s.fingerprint);
+
+  const results = dangerSongs.map((song) => {
+    const perSample = validSamples.map((s) => {
+      const score = compareFingerprints(s.fingerprint, song.fingerprint);
+      return { startSec: s.startSec, queryLen: s.fingerprint.length, score: +score.toFixed(4) };
+    });
+    return {
+      songTitle: song.title,
+      songFpLen: song.fingerprint?.length || 0,
+      samples: perSample,
+      bestScore: perSample.length ? Math.max(...perSample.map((p) => p.score)) : 0,
+    };
+  });
+
+  return { results, dangerSongsCount: dangerSongs.length, samplesCount: validSamples.length };
+}
+
+module.exports = { processJob, resolveYouTubeUrl, fingerprintDangerSong, debugMatch };

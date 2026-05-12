@@ -1,5 +1,5 @@
 const express = require("express");
-const { processJob, resolveYouTubeUrl, fingerprintDangerSong } = require("./scanner");
+const { processJob, resolveYouTubeUrl, fingerprintDangerSong, debugMatch } = require("./scanner");
 const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
@@ -60,6 +60,18 @@ app.post("/fingerprint-song", auth, async (req, res) => {
       .eq("id", songId)
       .then(() => {});
   });
+});
+
+// Debug: compare a YouTube URL against all danger songs synchronously, returns raw scores
+app.post("/debug-match", auth, async (req, res) => {
+  const { youtubeUrl, startSec = 0 } = req.body;
+  if (!youtubeUrl) return res.status(400).json({ error: "youtubeUrl required" });
+  try {
+    const result = await debugMatch(youtubeUrl, startSec);
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // Start a scan job — job must already exist in Supabase scan_jobs table
