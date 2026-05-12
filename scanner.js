@@ -90,9 +90,12 @@ function findMatches(samples, dangerSongs) {
   const matches = [];
   for (const song of dangerSongs) {
     if (!song.fingerprint) continue;
+    let bestScore = 0;
     for (const sample of samples) {
       if (!sample.fingerprint) continue;
       const score = compareFingerprints(sample.fingerprint, song.fingerprint);
+      console.log(`[match] "${song.title}" at ${sample.startSec}s: score=${score.toFixed(3)} (queryLen=${sample.fingerprint.length} songLen=${song.fingerprint.length})`);
+      if (score > bestScore) bestScore = score;
       if (score >= MATCH_THRESHOLD) {
         matches.push({
           song_id: song.id,
@@ -102,8 +105,11 @@ function findMatches(samples, dangerSongs) {
           detected_at_sec: sample.startSec,
           score: Math.round(score * 100),
         });
-        break; // one match per song per video is enough
+        break;
       }
+    }
+    if (bestScore < MATCH_THRESHOLD) {
+      console.log(`[match] "${song.title}" best score across all samples: ${bestScore.toFixed(3)} (threshold ${MATCH_THRESHOLD}) — NO MATCH`);
     }
   }
   return matches;
