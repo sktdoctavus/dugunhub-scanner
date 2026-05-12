@@ -64,9 +64,9 @@ function compareFingerprints(queryFp, songFp) {
 async function downloadSegment(videoUrl, startSec, durationSec, tmpDir) {
   // Use %(ext)s so yt-dlp keeps the native extension (webm, m4a, etc.)
   const outTemplate = path.join(tmpDir, `seg_${startSec}.%(ext)s`);
-  const cookiesPath = "/tmp/yt-cookies.txt";
-  const hasCookies = fs.existsSync(cookiesPath);
 
+  // tv_embedded uses YouTube's whitelisted embedded-player API — far less bot detection
+  // than web/ios. android is the fallback when tv_embedded lacks a format.
   const args = [
     "--no-playlist",
     "-x",
@@ -74,17 +74,8 @@ async function downloadSegment(videoUrl, startSec, durationSec, tmpDir) {
     "--download-sections", `*${startSec}-${startSec + durationSec}`,
     "--no-progress",
     "--js-runtimes", "node",
+    "--extractor-args", "youtube:player_client=tv_embedded,android",
   ];
-
-  if (hasCookies) {
-    // Cookies present: force web client explicitly so yt-dlp never tries ios
-    // (ios is in yt-dlp's default rotation and gets skipped with cookies, leaving only image formats)
-    args.push("--cookies", cookiesPath);
-    args.push("--extractor-args", "youtube:player_client=web");
-  } else {
-    // No cookies: pretend to be iOS app to bypass bot detection
-    args.push("--extractor-args", "youtube:player_client=ios");
-  }
 
   if (process.env.YTDLP_PROXY) {
     args.push("--proxy", process.env.YTDLP_PROXY);

@@ -88,14 +88,6 @@ app.post("/scan", auth, async (req, res) => {
   });
 });
 
-// Write YouTube cookies to disk at startup so yt-dlp can authenticate
-if (process.env.YOUTUBE_COOKIES) {
-  const fs = require("fs");
-  fs.writeFileSync("/tmp/yt-cookies.txt", process.env.YOUTUBE_COOKIES);
-  console.log("[startup] YouTube cookies written to /tmp/yt-cookies.txt");
-} else {
-  console.warn("[startup] YOUTUBE_COOKIES env var not set — YouTube bot detection may block downloads");
-}
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
