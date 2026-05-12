@@ -57,61 +57,59 @@ function compareFingerprints(queryFp, songFp) {
 
 // Download a YouTube audio segment and return the path to a FLAC temp file.
 //
-// yt-dlp --download-sections produces truncated opus/webm containers (the stream is
-// cut without a proper end-of-stream marker). WAV and raw-PCM output from such files
-// cause fpcalc to exit 3 ("Error decoding audio frame / End of file") regardless of
-// how the WAV header is constructed, because libchromaprint's internal libav parser
-// hits the EOF condition differently for those formats.
+// WHY NOT --download-sections:
+// yt-dlp --download-sections produces a truncated opus/webm container (the stream is
+// cut mid-bitstream). ffmpeg's -err_detect ignore_err can open the container but the
+// opus decoder produces garbage (random noise) for most frames because it lacks the
+// reference frames that were cut off. FLAC of random noise is larger than raw PCM —
+// confirmed by output sizes — so chromaprint exits 3 (fingerprint calc failed) on
+// every format we tried (WAV, raw PCM, FLAC).
 //
-// FLAC is self-framing: each frame carries its own sync word and sample count, so
-// the decoder never relies on a pre-declared total size. ffmpeg properly closes the
-// FLAC STREAMINFO after flushing the decoder, giving fpcalc a valid, complete file
-// even when the source container was truncated.
+// THE FIX:
+// Use `yt-dlp -g` to resolve the direct CDN stream URL, then let ffmpeg seek into
+// the live stream with -ss (HTTP Range seek, no decode-and-discard). ffmpeg reads a
+// properly formed stream from the seek point and outputs exactly durationSec seconds
+// of clean audio. No truncated containers, no garbage frames.
 async function downloadSegment(videoUrl, startSec, durationSec, tmpDir) {
-  const outTemplate = path.join(tmpDir, `seg_${startSec}.%(ext)s`);
+  const flacPath = path.join(tmpDir, `seg_${startSec}.flac`);
 
-  const args = [
+  // Step 1: resolve direct audio CDN URL
+  const ytArgs = [
+    "-g",
     "--no-playlist",
-    "-x",
     "--format", "bestaudio/best",
-    "--download-sections", `*${startSec}-${startSec + durationSec}`,
-    "--no-progress",
-    "--js-runtimes", "node",
     "--extractor-args", "youtube:player_client=tv_embedded,web_embedded,android_vr,android",
   ];
-  if (process.env.YTDLP_PROXY) args.push("--proxy", process.env.YTDLP_PROXY);
-  args.push("-o", outTemplate, videoUrl);
+  if (process.env.YTDLP_PROXY) ytArgs.push("--proxy", process.env.YTDLP_PROXY);
+  ytArgs.push(videoUrl);
+
+  const ytResult = spawnSync("yt-dlp", ytArgs, { timeout: 30000, encoding: "utf8" });
+  if (ytResult.status !== 0 || !ytResult.stdout?.trim()) {
+    throw new Error(
+      `yt-dlp -g failed (exit ${ytResult.status}): ${(ytResult.stderr || "").slice(0, 400)}`
+    );
+  }
+
+  // yt-dlp may print multiple lines (audio + video DASH URLs); take the first
+  const streamUrl = ytResult.stdout.trim().split("\n")[0];
+  console.log(`[yt-dlp] @${startSec}s resolved stream URL`);
+
+  // Step 2: ffmpeg seeks via HTTP Range (-ss before -i) and extracts durationSec seconds.
+  // Output is FLAC for a clean, self-framing container fpcalc handles natively.
+  const ffArgs = ["-ss", String(startSec), "-t", String(durationSec)];
+  if (process.env.YTDLP_PROXY) ffArgs.push("-http_proxy", process.env.YTDLP_PROXY);
+  ffArgs.push(
+    "-i", streamUrl,
+    "-ac", "1",
+    "-ar", "22050",
+    "-c:a", "flac",
+    "-y", flacPath,
+  );
 
   await new Promise((resolve, reject) => {
-    execFile("yt-dlp", args, { timeout: 120000 }, (err, stdout, stderr) => {
+    execFile("ffmpeg", ffArgs, { timeout: 120000 }, (err, stdout, stderr) => {
       if (err) {
-        const msg = (stderr || err.message || "unknown error").slice(0, 800);
-        console.error(`[yt-dlp] FAILED @${startSec}s: ${msg}`);
-        reject(new Error(msg));
-      } else {
-        if (stderr) console.log(`[yt-dlp] @${startSec}s ok. stderr: ${stderr.slice(0, 200)}`);
-        resolve();
-      }
-    });
-  });
-
-  const files = fs.readdirSync(tmpDir).filter((f) => f.startsWith(`seg_${startSec}.`));
-  if (files.length === 0) throw new Error(`yt-dlp produced no output for seg_${startSec}`);
-  const rawPath = path.join(tmpDir, files[0]);
-  console.log(`[yt-dlp] @${startSec}s saved: ${files[0]} (${fs.statSync(rawPath).size} bytes)`);
-
-  const flacPath = path.join(tmpDir, `seg_${startSec}.flac`);
-  await new Promise((resolve, reject) => {
-    execFile("ffmpeg", [
-      "-err_detect", "ignore_err",
-      "-i", rawPath,
-      "-ac", "1",
-      "-ar", "22050",
-      "-c:a", "flac",
-      "-y", flacPath,
-    ], { timeout: 30000 }, (err, stdout, stderr) => {
-      if (err) {
-        console.error(`[ffmpeg] @${startSec}s failed: ${(stderr || err.message).slice(0, 300)}`);
+        console.error(`[ffmpeg] @${startSec}s failed: ${(stderr || err.message).slice(0, 400)}`);
         reject(new Error(stderr || err.message));
       } else {
         const size = fs.existsSync(flacPath) ? fs.statSync(flacPath).size : 0;
@@ -122,7 +120,6 @@ async function downloadSegment(videoUrl, startSec, durationSec, tmpDir) {
     });
   });
 
-  fs.unlinkSync(rawPath);
   return flacPath;
 }
 
