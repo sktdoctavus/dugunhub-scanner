@@ -1,4 +1,4 @@
-const { execSync, exec } = require("child_process");
+const { execSync, exec, execFile } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
@@ -62,24 +62,37 @@ function compareFingerprints(queryFp, songFp) {
 // Download a specific time segment of a YouTube video as audio, return temp file path
 async function downloadSegment(videoUrl, startSec, durationSec, tmpDir) {
   const outPath = path.join(tmpDir, `seg_${startSec}.mp3`);
-  const cmd = [
-    "yt-dlp",
+  const args = [
     "--no-playlist",
     "--extract-audio",
-    "--audio-format mp3",
-    "--audio-quality 5",
-    `--download-sections "*${startSec}-${startSec + durationSec}"`,
+    "--audio-format", "mp3",
+    "--audio-quality", "0",
+    "--download-sections", `*${startSec}-${startSec + durationSec}`,
     "--force-keyframes-at-cuts",
-    "-o", `"${outPath}"`,
-    `"${videoUrl}"`,
-  ].join(" ");
+    "--no-progress",
+    "-o", outPath,
+    videoUrl,
+  ];
 
   await new Promise((resolve, reject) => {
-    exec(cmd, { timeout: 120000 }, (err, stdout, stderr) => {
-      if (err) reject(new Error(stderr || err.message));
-      else resolve();
+    execFile("yt-dlp", args, { timeout: 120000 }, (err, stdout, stderr) => {
+      if (err) {
+        const msg = (stderr || err.message || "unknown error").slice(0, 800);
+        console.error(`[yt-dlp] FAILED @${startSec}s: ${msg}`);
+        reject(new Error(msg));
+      } else {
+        if (stderr) console.log(`[yt-dlp] @${startSec}s stderr: ${stderr.slice(0, 300)}`);
+        resolve();
+      }
     });
   });
+
+  // yt-dlp sometimes saves with a different filename — check and fall back to glob
+  if (!fs.existsSync(outPath)) {
+    const files = fs.readdirSync(tmpDir).filter((f) => f.startsWith(`seg_${startSec}`) && f.endsWith(".mp3"));
+    if (files.length > 0) return path.join(tmpDir, files[0]);
+    throw new Error(`yt-dlp exited 0 but output file not found at ${outPath}`);
+  }
 
   return outPath;
 }
@@ -102,9 +115,10 @@ async function fingerprintVideo(videoUrl, videoDurationSec, options = {}) {
       try {
         audioPath = await downloadSegment(videoUrl, start, end - start, tmpDir);
         const { fingerprint } = getFingerprintFromFile(audioPath);
+        console.log(`[fp] sample @${start}s: ${fingerprint.length} ints`);
         samples.push({ startSec: start, fingerprint });
       } catch (e) {
-        // Skip this segment on error, don't fail the whole video
+        console.error(`[fp] sample @${start}s FAILED: ${e.message.slice(0, 300)}`);
         samples.push({ startSec: start, fingerprint: null, error: e.message });
       } finally {
         if (audioPath && fs.existsSync(audioPath)) fs.unlinkSync(audioPath);
