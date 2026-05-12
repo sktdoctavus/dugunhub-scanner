@@ -70,7 +70,7 @@ async function downloadSegment(videoUrl, startSec, durationSec, tmpDir) {
   const args = [
     "--no-playlist",
     "-x",
-    "--format", "bestaudio",
+    "--format", "bestaudio/best",
     "--download-sections", `*${startSec}-${startSec + durationSec}`,
     "--no-progress",
     "--js-runtimes", "node",
@@ -129,8 +129,10 @@ async function downloadSegment(videoUrl, startSec, durationSec, tmpDir) {
         console.error(`[ffmpeg] @${startSec}s failed: ${(stderr || err.message).slice(0, 200)}`);
         reject(new Error(stderr || err.message));
       } else {
-        console.log(`[ffmpeg] @${startSec}s → wav (${fs.statSync(wavPath).size} bytes)`);
-        resolve();
+        const size = fs.existsSync(wavPath) ? fs.statSync(wavPath).size : 0;
+        console.log(`[ffmpeg] @${startSec}s → wav (${size} bytes)`);
+        if (size === 0) reject(new Error("ffmpeg produced empty WAV file"));
+        else resolve();
       }
     });
   });
