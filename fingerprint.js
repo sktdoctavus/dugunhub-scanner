@@ -55,25 +55,8 @@ function compareFingerprints(queryFp, songFp) {
   return best;
 }
 
-// Download a YouTube audio segment and return the path to a FLAC temp file.
-//
-// WHY NOT --download-sections:
-// yt-dlp --download-sections produces a truncated opus/webm container (the stream is
-// cut mid-bitstream). ffmpeg's -err_detect ignore_err can open the container but the
-// opus decoder produces garbage (random noise) for most frames because it lacks the
-// reference frames that were cut off. FLAC of random noise is larger than raw PCM —
-// confirmed by output sizes — so chromaprint exits 3 (fingerprint calc failed) on
-// every format we tried (WAV, raw PCM, FLAC).
-//
-// THE FIX:
-// Use `yt-dlp -g` to resolve the direct CDN stream URL, then let ffmpeg seek into
-// the live stream with -ss (HTTP Range seek, no decode-and-discard). ffmpeg reads a
-// properly formed stream from the seek point and outputs exactly durationSec seconds
-// of clean audio. No truncated containers, no garbage frames.
-async function downloadSegment(videoUrl, startSec, durationSec, tmpDir) {
-  const flacPath = path.join(tmpDir, `seg_${startSec}.flac`);
-
-  // Step 1: resolve direct audio CDN URL
+// Resolve the direct audio CDN URL for a YouTube video URL (called once per video).
+function resolveStreamUrl(videoUrl) {
   const ytArgs = [
     "-g",
     "--no-playlist",
@@ -83,19 +66,23 @@ async function downloadSegment(videoUrl, startSec, durationSec, tmpDir) {
   if (process.env.YTDLP_PROXY) ytArgs.push("--proxy", process.env.YTDLP_PROXY);
   ytArgs.push(videoUrl);
 
-  const ytResult = spawnSync("yt-dlp", ytArgs, { timeout: 30000, encoding: "utf8" });
-  if (ytResult.status !== 0 || !ytResult.stdout?.trim()) {
+  const result = spawnSync("yt-dlp", ytArgs, { timeout: 60000, encoding: "utf8" });
+  if (result.status !== 0 || !result.stdout?.trim()) {
     throw new Error(
-      `yt-dlp -g failed (exit ${ytResult.status}): ${(ytResult.stderr || "").slice(0, 400)}`
+      `yt-dlp -g failed (exit ${result.status}): ${(result.stderr || "").slice(0, 400)}`
     );
   }
-
   // yt-dlp may print multiple lines (audio + video DASH URLs); take the first
-  const streamUrl = ytResult.stdout.trim().split("\n")[0];
-  console.log(`[yt-dlp] @${startSec}s resolved stream URL`);
+  return result.stdout.trim().split("\n")[0];
+}
 
-  // Step 2: ffmpeg seeks via HTTP Range (-ss before -i) and extracts durationSec seconds.
-  // Output is FLAC for a clean, self-framing container fpcalc handles natively.
+// Download one audio segment from an already-resolved CDN stream URL.
+// streamUrl comes from resolveStreamUrl() — called once per video, not per sample.
+async function downloadSegment(streamUrl, startSec, durationSec, tmpDir) {
+  const flacPath = path.join(tmpDir, `seg_${startSec}.flac`);
+
+  // ffmpeg -ss before -i = HTTP Range seek (no decode-and-discard).
+  // -t limits output to exactly durationSec seconds.
   const ffArgs = ["-ss", String(startSec), "-t", String(durationSec)];
   if (process.env.YTDLP_PROXY) ffArgs.push("-http_proxy", process.env.YTDLP_PROXY);
   ffArgs.push(
@@ -130,6 +117,18 @@ async function fingerprintVideo(videoUrl, videoDurationSec, options = {}) {
   const sampleDurationSec = options.sampleDurationSec || 30;
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "dugunhub-"));
 
+  // Resolve the CDN stream URL once for the whole video — not once per sample.
+  // A single yt-dlp -g call takes ~30s; resolving per sample multiplies that cost
+  // by the number of samples (e.g. 20× for a 1-hour video).
+  let streamUrl;
+  try {
+    console.log(`[yt-dlp] resolving stream URL...`);
+    streamUrl = resolveStreamUrl(videoUrl);
+    console.log(`[yt-dlp] stream URL resolved`);
+  } catch (e) {
+    return [{ startSec: 0, fingerprint: null, error: e.message }];
+  }
+
   const samples = [];
   try {
     for (let start = 0; start < videoDurationSec; start += intervalSec) {
@@ -138,7 +137,7 @@ async function fingerprintVideo(videoUrl, videoDurationSec, options = {}) {
 
       let audioPath;
       try {
-        audioPath = await downloadSegment(videoUrl, start, end - start, tmpDir);
+        audioPath = await downloadSegment(streamUrl, start, end - start, tmpDir);
         const { fingerprint } = getFingerprintFromFile(audioPath);
         console.log(`[fp] sample @${start}s: ${fingerprint.length} ints`);
         samples.push({ startSec: start, fingerprint });

@@ -19,7 +19,11 @@ async function resolveYouTubeUrl(url) {
   const videoMatch = url.match(/(?:v=|youtu\.be\/)([A-Za-z0-9_-]{11})/);
   const playlistMatch = url.match(/[?&]list=([A-Za-z0-9_-]+)/);
 
-  if (playlistMatch) {
+  // RD/WL/LL/FL prefixes are auto-generated YouTube mixes — not real playlists,
+  // the playlistItems API returns nothing useful for them. Treat as single video.
+  const isAutoPlaylist = playlistMatch && /^(RD|WL|LL|FL|OLAK)/.test(playlistMatch[1]);
+
+  if (playlistMatch && !isAutoPlaylist) {
     return await fetchPlaylistVideos(playlistMatch[1]);
   } else if (videoMatch) {
     const video = await fetchVideoDetails([videoMatch[1]]);
