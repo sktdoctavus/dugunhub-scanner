@@ -1,4 +1,4 @@
-const { execFile, spawnSync } = require("child_process");
+const { execFile, execFileSync, spawnSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
@@ -140,9 +140,34 @@ async function fingerprintVideo(videoUrl, videoDurationSec, options = {}) {
       let audioPath;
       try {
         audioPath = await downloadSegment(streamUrl, start, end - start, tmpDir);
-        const { fingerprint } = getFingerprintFromFile(audioPath);
-        console.log(`[fp] sample @${start}s: ${fingerprint.length} ints`);
-        samples.push({ startSec: start, fingerprint });
+
+        // Full window (e.g. 30s) — catches songs that span most of the window
+        const { fingerprint: fullFp } = getFingerprintFromFile(audioPath);
+        console.log(`[fp] sample @${start}s: ${fullFp.length} ints`);
+        samples.push({ startSec: start, fingerprint: fullFp });
+
+        // Also fingerprint each 15s half independently — catches a song that
+        // only plays for 10-15s and would be diluted in the full-window average.
+        // fpcalc needs ≥10s of audio to produce a usable fingerprint.
+        const halfDur = Math.floor((end - start) / 2);
+        if (halfDur >= 10) {
+          const halfPath1 = path.join(tmpDir, `seg_${start}_h1.flac`);
+          const halfPath2 = path.join(tmpDir, `seg_${start}_h2.flac`);
+          try {
+            // Write first half
+            execFileSync("ffmpeg", ["-i", audioPath, "-ss", "0", "-t", String(halfDur), "-y", halfPath1], { timeout: 30000 });
+            execFileSync("ffmpeg", ["-i", audioPath, "-ss", String(halfDur), "-t", String(halfDur), "-y", halfPath2], { timeout: 30000 });
+            const { fingerprint: fp1 } = getFingerprintFromFile(halfPath1);
+            const { fingerprint: fp2 } = getFingerprintFromFile(halfPath2);
+            samples.push({ startSec: start, fingerprint: fp1 });
+            samples.push({ startSec: start + halfDur, fingerprint: fp2 });
+            console.log(`[fp] halves @${start}s/${start + halfDur}s: ${fp1.length}/${fp2.length} ints`);
+          } finally {
+            for (const p of [halfPath1, halfPath2]) {
+              try { if (fs.existsSync(p)) fs.unlinkSync(p); } catch {}
+            }
+          }
+        }
       } catch (e) {
         console.error(`[fp] sample @${start}s FAILED: ${e.message.slice(0, 500)}`);
         samples.push({ startSec: start, fingerprint: null, error: e.message });
