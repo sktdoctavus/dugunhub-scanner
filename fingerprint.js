@@ -35,21 +35,23 @@ function bitErrorRate(fp1, fp2) {
 
 // Compare a short query fingerprint against a longer song fingerprint using a sliding
 // window. Returns the best match score 0-1 (1 = identical).
+// BER divisor 0.45: tolerates up to 45% bit errors to handle mixed/overlaid audio.
 function compareFingerprints(queryFp, songFp) {
   if (!queryFp?.length || !songFp?.length) return 0;
 
   if (songFp.length <= queryFp.length) {
     const ber = bitErrorRate(queryFp, songFp);
-    return Math.max(0, 1 - ber / 0.35);
+    return Math.max(0, 1 - ber / 0.45);
   }
 
   const step = Math.max(1, Math.floor(queryFp.length / 3));
   let best = 0;
+  let bestBer = 1;
   for (let offset = 0; offset <= songFp.length - queryFp.length; offset += step) {
     const window = songFp.slice(offset, offset + queryFp.length);
     const ber = bitErrorRate(queryFp, window);
-    const score = Math.max(0, 1 - ber / 0.35);
-    if (score > best) best = score;
+    const score = Math.max(0, 1 - ber / 0.45);
+    if (score > best) { best = score; bestBer = ber; }
     if (best >= 0.9) break;
   }
   return best;
@@ -113,7 +115,7 @@ async function downloadSegment(streamUrl, startSec, durationSec, tmpDir) {
 // Extract audio fingerprints from a YouTube video by sampling every intervalSec seconds.
 // Returns array of { startSec, fingerprint }.
 async function fingerprintVideo(videoUrl, videoDurationSec, options = {}) {
-  const intervalSec = options.intervalSec || 180;
+  const intervalSec = options.intervalSec || 60;
   const sampleDurationSec = options.sampleDurationSec || 30;
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "dugunhub-"));
 

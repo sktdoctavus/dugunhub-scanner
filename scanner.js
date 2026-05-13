@@ -9,7 +9,7 @@ const supabase = createClient(
 );
 
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
-const MATCH_THRESHOLD = 0.5;
+const MATCH_THRESHOLD = 0.35;
 const DELAY_BETWEEN_VIDEOS_MS = 20000; // 20s delay between videos to avoid YouTube blocking
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 300000; // 5 minutes on block
