@@ -2,6 +2,8 @@ const { execFile, execFileSync, spawnSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const FormData = require("form-data");
+const axios = require("axios");
 
 // Generate chromaprint fingerprint for an audio file — used for danger song approval only.
 function getFingerprintFromFile(audioPath) {
@@ -71,20 +73,19 @@ async function downloadSegment(streamUrl, startSec, durationSec, tmpDir) {
 // Send an audio file to AudD for recognition.
 // Returns { title, artist } or null if no song recognized.
 async function recognizeWithAudd(audioPath, apiToken) {
-  const audioData = fs.readFileSync(audioPath);
   const formData = new FormData();
   formData.append("api_token", apiToken);
-  formData.append("audio", new Blob([audioData], { type: "audio/flac" }), "audio.flac");
-
-  const response = await fetch("https://api.audd.io/", {
-    method: "POST",
-    body: formData,
-    signal: AbortSignal.timeout(30000),
+  formData.append("audio", fs.createReadStream(audioPath), {
+    filename: "audio.flac",
+    contentType: "audio/flac",
   });
 
-  if (!response.ok) throw new Error(`AudD HTTP ${response.status}`);
+  const response = await axios.post("https://api.audd.io/", formData, {
+    headers: formData.getHeaders(),
+    timeout: 30000,
+  });
 
-  const data = await response.json();
+  const data = response.data;
 
   if (data.status === "error") {
     throw new Error(`AudD error: ${data.error?.error_message || JSON.stringify(data.error)}`);
