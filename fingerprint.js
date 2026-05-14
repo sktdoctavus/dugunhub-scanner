@@ -2,8 +2,6 @@ const { execFile, execFileSync, spawnSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
-const FormData = require("form-data");
-const axios = require("axios");
 
 // Generate chromaprint fingerprint for an audio file — used for danger song approval only.
 function getFingerprintFromFile(audioPath) {
@@ -70,22 +68,22 @@ async function downloadSegment(streamUrl, startSec, durationSec, tmpDir) {
   return flacPath;
 }
 
-// Send an audio file to AudD for recognition.
+// Send an audio file to AudD via curl — bypasses Node.js HTTP client
+// multipart issues entirely. curl -F handles file upload reliably.
 // Returns { title, artist } or null if no song recognized.
-async function recognizeWithAudd(audioPath, apiToken) {
-  const formData = new FormData();
-  formData.append("api_token", apiToken);
-  formData.append("audio", fs.createReadStream(audioPath), {
-    filename: "audio.flac",
-    contentType: "audio/flac",
-  });
+function recognizeWithAudd(audioPath, apiToken) {
+  const result = spawnSync("curl", [
+    "-s",
+    "-F", `api_token=${apiToken}`,
+    "-F", `audio=@${audioPath}`,
+    "https://api.audd.io/",
+  ], { timeout: 30000, encoding: "utf8" });
 
-  const response = await axios.post("https://api.audd.io/", formData, {
-    headers: formData.getHeaders(),
-    timeout: 30000,
-  });
+  if (result.status !== 0 || !result.stdout?.trim()) {
+    throw new Error(`AudD curl failed (exit ${result.status}): ${(result.stderr || "no output").slice(0, 200)}`);
+  }
 
-  const data = response.data;
+  const data = JSON.parse(result.stdout);
 
   if (data.status === "error") {
     throw new Error(`AudD error: ${data.error?.error_message || JSON.stringify(data.error)}`);
