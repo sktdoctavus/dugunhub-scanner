@@ -79,6 +79,8 @@ function recognizeWithAudd(audioPath, apiToken) {
     "https://api.audd.io/",
   ], { timeout: 30000, encoding: "utf8" });
 
+  console.log(`[audd-raw] exit=${result.status} stderr=${(result.stderr || "").slice(0, 100)} stdout=${(result.stdout || "").slice(0, 300)}`);
+
   if (result.status !== 0 || !result.stdout?.trim()) {
     throw new Error(`AudD curl failed (exit ${result.status}): ${(result.stderr || "no output").slice(0, 200)}`);
   }

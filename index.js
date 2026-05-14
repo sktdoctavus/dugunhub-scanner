@@ -92,4 +92,6 @@ app.post("/scan", auth, async (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`DüğünHub scanner worker listening on port ${PORT}`);
+  console.log(`[config] AUDD_API_TOKEN set: ${!!process.env.AUDD_API_TOKEN}`);
+  console.log(`[config] YTDLP_PROXY set: ${!!process.env.YTDLP_PROXY}`);
 });
