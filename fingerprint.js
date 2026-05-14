@@ -3,8 +3,7 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 
-// Generate chromaprint fingerprint for an audio file (WAV, FLAC, MP3, etc.)
-// Returns { fingerprint: int[], duration }
+// Generate chromaprint fingerprint for an audio file — used for danger song approval only.
 function getFingerprintFromFile(audioPath) {
   const result = spawnSync("fpcalc", ["-raw", "-json", audioPath], {
     timeout: 60000,
@@ -16,45 +15,6 @@ function getFingerprintFromFile(audioPath) {
   }
   const parsed = JSON.parse(result.stdout);
   return { fingerprint: parsed.fingerprint, duration: parsed.duration };
-}
-
-// Bit error rate between two fingerprint arrays (lower = more similar)
-function bitErrorRate(fp1, fp2) {
-  const len = Math.min(fp1.length, fp2.length);
-  if (len === 0) return 1;
-  let errors = 0;
-  for (let i = 0; i < len; i++) {
-    let diff = fp1[i] ^ fp2[i];
-    while (diff) {
-      errors += diff & 1;
-      diff >>>= 1;
-    }
-  }
-  return errors / (len * 32);
-}
-
-// Compare a short query fingerprint against a longer song fingerprint using a sliding
-// window. Returns the best match score 0-1 (1 = identical).
-// BER divisor 0.45: tolerates up to 45% bit errors to handle mixed/overlaid audio.
-function compareFingerprints(queryFp, songFp) {
-  if (!queryFp?.length || !songFp?.length) return 0;
-
-  if (songFp.length <= queryFp.length) {
-    const ber = bitErrorRate(queryFp, songFp);
-    return Math.max(0, 1 - ber / 0.45);
-  }
-
-  const step = Math.max(1, Math.floor(queryFp.length / 3));
-  let best = 0;
-  let bestBer = 1;
-  for (let offset = 0; offset <= songFp.length - queryFp.length; offset += step) {
-    const window = songFp.slice(offset, offset + queryFp.length);
-    const ber = bitErrorRate(queryFp, window);
-    const score = Math.max(0, 1 - ber / 0.45);
-    if (score > best) { best = score; bestBer = ber; }
-    if (best >= 0.9) break;
-  }
-  return best;
 }
 
 // Resolve the direct audio CDN URL for a YouTube video URL (called once per video).
@@ -74,17 +34,13 @@ function resolveStreamUrl(videoUrl) {
       `yt-dlp -g failed (exit ${result.status}): ${(result.stderr || "").slice(0, 400)}`
     );
   }
-  // yt-dlp may print multiple lines (audio + video DASH URLs); take the first
   return result.stdout.trim().split("\n")[0];
 }
 
 // Download one audio segment from an already-resolved CDN stream URL.
-// streamUrl comes from resolveStreamUrl() — called once per video, not per sample.
 async function downloadSegment(streamUrl, startSec, durationSec, tmpDir) {
   const flacPath = path.join(tmpDir, `seg_${startSec}.flac`);
 
-  // ffmpeg -ss before -i = HTTP Range seek (no decode-and-discard).
-  // -t limits output to exactly durationSec seconds.
   const ffArgs = ["-ss", String(startSec), "-t", String(durationSec)];
   if (process.env.YTDLP_PROXY) ffArgs.push("-http_proxy", process.env.YTDLP_PROXY);
   ffArgs.push(
@@ -112,74 +68,38 @@ async function downloadSegment(streamUrl, startSec, durationSec, tmpDir) {
   return flacPath;
 }
 
-// Extract audio fingerprints from a YouTube video by sampling every intervalSec seconds.
-// Returns array of { startSec, fingerprint }.
-async function fingerprintVideo(videoUrl, videoDurationSec, options = {}) {
-  const intervalSec = options.intervalSec || 60;
-  const sampleDurationSec = options.sampleDurationSec || 30;
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "dugunhub-"));
+// Send an audio file to AudD for recognition.
+// Returns { title, artist } or null if no song recognized.
+async function recognizeWithAudd(audioPath, apiToken) {
+  const audioData = fs.readFileSync(audioPath);
+  const formData = new FormData();
+  formData.append("api_token", apiToken);
+  formData.append("audio", new Blob([audioData], { type: "audio/flac" }), "audio.flac");
 
-  // Resolve the CDN stream URL once for the whole video — not once per sample.
-  // A single yt-dlp -g call takes ~30s; resolving per sample multiplies that cost
-  // by the number of samples (e.g. 20× for a 1-hour video).
-  let streamUrl;
-  try {
-    console.log(`[yt-dlp] resolving stream URL...`);
-    streamUrl = resolveStreamUrl(videoUrl);
-    console.log(`[yt-dlp] stream URL resolved`);
-  } catch (e) {
-    return [{ startSec: 0, fingerprint: null, error: e.message }];
+  const response = await fetch("https://api.audd.io/", {
+    method: "POST",
+    body: formData,
+    signal: AbortSignal.timeout(30000),
+  });
+
+  if (!response.ok) throw new Error(`AudD HTTP ${response.status}`);
+
+  const data = await response.json();
+
+  if (data.status === "error") {
+    throw new Error(`AudD error: ${data.error?.error_message || JSON.stringify(data.error)}`);
   }
 
-  const samples = [];
-  try {
-    for (let start = 0; start < videoDurationSec; start += intervalSec) {
-      const end = Math.min(start + sampleDurationSec, videoDurationSec);
-      if (end <= start) break;
-
-      let audioPath;
-      try {
-        audioPath = await downloadSegment(streamUrl, start, end - start, tmpDir);
-
-        // Full window (e.g. 30s) — catches songs that span most of the window
-        const { fingerprint: fullFp } = getFingerprintFromFile(audioPath);
-        console.log(`[fp] sample @${start}s: ${fullFp.length} ints`);
-        samples.push({ startSec: start, fingerprint: fullFp });
-
-        // Also fingerprint each 15s half independently — catches a song that
-        // only plays for 10-15s and would be diluted in the full-window average.
-        // fpcalc needs ≥10s of audio to produce a usable fingerprint.
-        const halfDur = Math.floor((end - start) / 2);
-        if (halfDur >= 10) {
-          const halfPath1 = path.join(tmpDir, `seg_${start}_h1.flac`);
-          const halfPath2 = path.join(tmpDir, `seg_${start}_h2.flac`);
-          try {
-            // Write first half
-            execFileSync("ffmpeg", ["-i", audioPath, "-ss", "0", "-t", String(halfDur), "-y", halfPath1], { timeout: 30000 });
-            execFileSync("ffmpeg", ["-i", audioPath, "-ss", String(halfDur), "-t", String(halfDur), "-y", halfPath2], { timeout: 30000 });
-            const { fingerprint: fp1 } = getFingerprintFromFile(halfPath1);
-            const { fingerprint: fp2 } = getFingerprintFromFile(halfPath2);
-            samples.push({ startSec: start, fingerprint: fp1 });
-            samples.push({ startSec: start + halfDur, fingerprint: fp2 });
-            console.log(`[fp] halves @${start}s/${start + halfDur}s: ${fp1.length}/${fp2.length} ints`);
-          } finally {
-            for (const p of [halfPath1, halfPath2]) {
-              try { if (fs.existsSync(p)) fs.unlinkSync(p); } catch {}
-            }
-          }
-        }
-      } catch (e) {
-        console.error(`[fp] sample @${start}s FAILED: ${e.message.slice(0, 500)}`);
-        samples.push({ startSec: start, fingerprint: null, error: e.message });
-      } finally {
-        if (audioPath && fs.existsSync(audioPath)) fs.unlinkSync(audioPath);
-      }
-    }
-  } finally {
-    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+  if (data.status === "success" && data.result) {
+    return {
+      title: data.result.title,
+      artist: data.result.artist,
+      album: data.result.album,
+      timecode: data.result.timecode,
+    };
   }
 
-  return samples;
+  return null;
 }
 
-module.exports = { getFingerprintFromFile, compareFingerprints, fingerprintVideo };
+module.exports = { getFingerprintFromFile, resolveStreamUrl, downloadSegment, recognizeWithAudd };

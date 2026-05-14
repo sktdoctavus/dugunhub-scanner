@@ -1,7 +1,9 @@
 const { createClient } = require("@supabase/supabase-js");
-const { fingerprintVideo, compareFingerprints } = require("./fingerprint");
-const { execSync } = require("child_process");
+const { getFingerprintFromFile, resolveStreamUrl, downloadSegment, recognizeWithAudd } = require("./fingerprint");
 const axios = require("axios");
+const fs = require("fs");
+const path = require("path");
+const os = require("os");
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -9,10 +11,15 @@ const supabase = createClient(
 );
 
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
-const MATCH_THRESHOLD = 0.35;
-const DELAY_BETWEEN_VIDEOS_MS = 20000; // 20s delay between videos to avoid YouTube blocking
+const AUDD_API_TOKEN = process.env.AUDD_API_TOKEN;
+const DELAY_BETWEEN_VIDEOS_MS = 20000;
 const MAX_RETRIES = 3;
-const RETRY_DELAY_MS = 300000; // 5 minutes on block
+const RETRY_DELAY_MS = 300000;
+
+// Interval between audio samples — 120s catches any song longer than 2 minutes
+const SAMPLE_INTERVAL_SEC = 120;
+// Duration of each audio clip sent to AudD — 15s is optimal for their standard endpoint
+const SAMPLE_DURATION_SEC = 15;
 
 // Fetch all video IDs + durations from a YouTube playlist or single video URL
 async function resolveYouTubeUrl(url) {
@@ -26,8 +33,7 @@ async function resolveYouTubeUrl(url) {
   if (playlistMatch && !isAutoPlaylist) {
     return await fetchPlaylistVideos(playlistMatch[1]);
   } else if (videoMatch) {
-    const video = await fetchVideoDetails([videoMatch[1]]);
-    return video;
+    return await fetchVideoDetails([videoMatch[1]]);
   }
   throw new Error("Invalid YouTube URL");
 }
@@ -77,68 +83,112 @@ function parseDuration(iso) {
   return (parseInt(m[1] || 0) * 3600) + (parseInt(m[2] || 0) * 60) + parseInt(m[3] || 0);
 }
 
-// Load all approved danger songs with their fingerprints from Supabase
+// Load all approved danger songs from Supabase (no fingerprint required — AudD matches by title/artist)
 async function loadDangerSongs() {
   const { data, error } = await supabase
     .from("danger_songs")
-    .select("id, title, artist, claimant, fingerprint")
-    .eq("approved", true)
-    .not("fingerprint", "is", null);
+    .select("id, title, artist, claimant")
+    .eq("approved", true);
 
   if (error) throw new Error(`Failed to load danger songs: ${error.message}`);
   return data || [];
 }
 
-// Compare video samples against all danger songs, return matches
-function findMatches(samples, dangerSongs) {
-  const matches = [];
-  for (const song of dangerSongs) {
-    if (!song.fingerprint) continue;
-    let bestScore = 0;
-    for (const sample of samples) {
-      if (!sample.fingerprint) continue;
-      const score = compareFingerprints(sample.fingerprint, song.fingerprint);
-      console.log(`[match] "${song.title}" at ${sample.startSec}s: score=${score.toFixed(3)} (queryLen=${sample.fingerprint.length} songLen=${song.fingerprint.length})`);
-      if (score > bestScore) bestScore = score;
-      if (score >= MATCH_THRESHOLD) {
-        matches.push({
-          song_id: song.id,
-          song_title: song.title,
-          song_artist: song.artist,
-          claimant: song.claimant,
-          detected_at_sec: sample.startSec,
-          score: Math.round(score * 100),
-        });
-        break;
-      }
-    }
-    if (bestScore < MATCH_THRESHOLD) {
-      console.log(`[match] "${song.title}" best score across all samples: ${bestScore.toFixed(3)} (threshold ${MATCH_THRESHOLD}) — NO MATCH`);
-    }
-  }
-  return matches;
+// Normalize a string for fuzzy comparison: lowercase, strip diacritics and punctuation
+function normalize(str) {
+  return (str || "")
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
-// Process a single video with retry on YouTube block
-async function processVideo(video, dangerSongs, attempt = 1) {
-  try {
-    const samples = await fingerprintVideo(video.url, video.durationSec);
-    const validSamples = samples.filter((s) => s.fingerprint);
-    const matches = findMatches(validSamples, dangerSongs);
-    return { status: "done", matches, samplesChecked: validSamples.length };
-  } catch (e) {
-    const blocked = e.message.includes("429") || e.message.includes("blocked") || e.message.includes("HTTP Error 403");
-    if (blocked && attempt < MAX_RETRIES) {
-      await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
-      return processVideo(video, dangerSongs, attempt + 1);
+// Check if an AudD recognition result matches any danger song by title
+function matchesDangerSong(recognition, dangerSongs) {
+  if (!recognition?.title) return null;
+  const recTitle = normalize(recognition.title);
+
+  for (const song of dangerSongs) {
+    const songTitle = normalize(song.title);
+    if (recTitle === songTitle ||
+        recTitle.includes(songTitle) ||
+        songTitle.includes(recTitle)) {
+      return song;
     }
-    return { status: "failed", error: e.message, matches: [] };
+  }
+  return null;
+}
+
+// Scan a single video with AudD — downloads 15s clips every 120s and recognizes each
+async function processVideo(video, dangerSongs, attempt = 1) {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "dugunhub-"));
+
+  try {
+    let streamUrl;
+    try {
+      console.log(`[yt-dlp] resolving stream URL for "${video.title}"...`);
+      streamUrl = resolveStreamUrl(video.url);
+      console.log(`[yt-dlp] stream URL resolved`);
+    } catch (e) {
+      const blocked = e.message.includes("429") || e.message.includes("blocked") || e.message.includes("HTTP Error 403");
+      if (blocked && attempt < MAX_RETRIES) {
+        await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
+        return processVideo(video, dangerSongs, attempt + 1);
+      }
+      return { status: "failed", error: e.message, matches: [] };
+    }
+
+    const matches = [];
+    const matchedSongIds = new Set();
+    let samplesChecked = 0;
+
+    for (let start = 0; start < video.durationSec; start += SAMPLE_INTERVAL_SEC) {
+      const duration = Math.min(SAMPLE_DURATION_SEC, video.durationSec - start);
+      if (duration < 5) break;
+
+      let audioPath;
+      try {
+        audioPath = await downloadSegment(streamUrl, start, duration, tmpDir);
+        const recognition = await recognizeWithAudd(audioPath, AUDD_API_TOKEN);
+        samplesChecked++;
+
+        if (recognition) {
+          console.log(`[audd] @${start}s: "${recognition.title}" by ${recognition.artist}`);
+          const dangerSong = matchesDangerSong(recognition, dangerSongs);
+          if (dangerSong && !matchedSongIds.has(dangerSong.id)) {
+            matchedSongIds.add(dangerSong.id);
+            console.log(`[audd] MATCH: "${dangerSong.title}" at ${start}s`);
+            matches.push({
+              song_id: dangerSong.id,
+              song_title: dangerSong.title,
+              song_artist: dangerSong.artist,
+              claimant: dangerSong.claimant,
+              detected_at_sec: start,
+              score: 100,
+              audd_title: recognition.title,
+              audd_artist: recognition.artist,
+            });
+          }
+        } else {
+          console.log(`[audd] @${start}s: no match`);
+        }
+      } catch (e) {
+        console.error(`[audd] @${start}s FAILED: ${e.message.slice(0, 500)}`);
+      } finally {
+        if (audioPath && fs.existsSync(audioPath)) fs.unlinkSync(audioPath);
+      }
+    }
+
+    return { status: "done", matches, samplesChecked };
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
   }
 }
 
 // Main scan job processor
 async function processJob(jobId) {
-  // Mark job as running
   await supabase.from("scan_jobs").update({ status: "running", started_at: new Date().toISOString() }).eq("id", jobId);
 
   try {
@@ -165,17 +215,11 @@ async function processJob(jobId) {
     for (let i = 0; i < videos.length; i++) {
       const video = videos[i];
 
-      // Show which video is currently being processed
-      await supabase.from("scan_jobs").update({
-        progress_title: video.title,
-      }).eq("id", jobId);
+      await supabase.from("scan_jobs").update({ progress_title: video.title }).eq("id", jobId);
 
       const result = await processVideo(video, dangerSongs);
 
-      // Update progress count after video is done
-      await supabase.from("scan_jobs").update({
-        progress_video: i + 1,
-      }).eq("id", jobId);
+      await supabase.from("scan_jobs").update({ progress_video: i + 1 }).eq("id", jobId);
 
       results.push({
         video_id: video.id,
@@ -187,7 +231,6 @@ async function processJob(jobId) {
         error: result.error || null,
       });
 
-      // Delay between videos to avoid YouTube blocking
       if (i < videos.length - 1) {
         await new Promise((r) => setTimeout(r, DELAY_BETWEEN_VIDEOS_MS));
       }
@@ -211,14 +254,9 @@ async function processJob(jobId) {
   }
 }
 
-// Extract and store fingerprint for a danger_song from its uploaded audio file.
-// YouTube link is reference-only and never used for downloading.
+// Extract and store chromaprint fingerprint for a danger_song from its uploaded audio file.
+// The fingerprint is kept for historical reference; AudD title/artist matching is now used for scanning.
 async function fingerprintDangerSong(songId) {
-  const fs = require("fs");
-  const path = require("path");
-  const os = require("os");
-  const { getFingerprintFromFile } = require("./fingerprint");
-
   const setNote = (msg) => supabase.from("danger_songs").update({ notes: `[fp] ${msg}` }).eq("id", songId).then(() => {});
 
   await setNote("started");
@@ -278,35 +316,21 @@ async function fingerprintDangerSong(songId) {
   }
 }
 
-// Debug: fingerprint one 30s clip from a URL and compare against all danger songs
-// Returns raw scores for diagnosis
+// Debug: recognize one 15s clip from a YouTube URL via AudD and return the raw result
 async function debugMatch(youtubeUrl, startSec = 0) {
-  const { fingerprintVideo } = require("./fingerprint");
-  const dangerSongs = await loadDangerSongs();
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "dugunhub-dbg-"));
+  try {
+    const streamUrl = resolveStreamUrl(youtubeUrl);
+    const audioPath = await downloadSegment(streamUrl, startSec, 15, tmpDir);
+    const recognition = await recognizeWithAudd(audioPath, AUDD_API_TOKEN);
 
-  // Only download one sample starting at the given offset
-  const durationNeeded = startSec + 31;
-  const samples = await fingerprintVideo(youtubeUrl, durationNeeded, {
-    intervalSec: startSec === 0 ? 999999 : startSec,
-    sampleDurationSec: 30,
-  });
+    const dangerSongs = await loadDangerSongs();
+    const match = recognition ? matchesDangerSong(recognition, dangerSongs) : null;
 
-  const validSamples = samples.filter((s) => s.fingerprint);
-
-  const results = dangerSongs.map((song) => {
-    const perSample = validSamples.map((s) => {
-      const score = compareFingerprints(s.fingerprint, song.fingerprint);
-      return { startSec: s.startSec, queryLen: s.fingerprint.length, score: +score.toFixed(4) };
-    });
-    return {
-      songTitle: song.title,
-      songFpLen: song.fingerprint?.length || 0,
-      samples: perSample,
-      bestScore: perSample.length ? Math.max(...perSample.map((p) => p.score)) : 0,
-    };
-  });
-
-  return { results, dangerSongsCount: dangerSongs.length, samplesCount: validSamples.length };
+    return { startSec, recognition, dangerSongMatch: match || null };
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+  }
 }
 
 module.exports = { processJob, resolveYouTubeUrl, fingerprintDangerSong, debugMatch };
