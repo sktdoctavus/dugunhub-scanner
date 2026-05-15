@@ -89,7 +89,7 @@ async function recognizeWithAudd(audioPath, apiToken) {
     `Content-Disposition: form-data; name="api_token"${CRLF}${CRLF}` +
     `${apiToken}${CRLF}` +
     `--${boundary}${CRLF}` +
-    `Content-Disposition: form-data; name="audio"; filename="${fileName}"${CRLF}` +
+    `Content-Disposition: form-data; name="file"; filename="${fileName}"${CRLF}` +
     `Content-Type: audio/mpeg${CRLF}${CRLF}`
   );
   const footerBuf = Buffer.from(`${CRLF}--${boundary}--${CRLF}`);
