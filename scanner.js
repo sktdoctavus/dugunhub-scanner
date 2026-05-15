@@ -153,6 +153,7 @@ async function processVideo(video, dangerSongs, jobId, onBatchComplete, attempt 
     const recognizedSongs = []; // every song AudD found, danger or not
     let samplesChecked = 0;
     let rateLimited = false;
+    let cancelled = false;
 
     // Build the full list of segments to check
     const segments = [];
@@ -164,17 +165,23 @@ async function processVideo(video, dangerSongs, jobId, onBatchComplete, attempt 
 
     // Process SCAN_CONCURRENCY segments at a time — ~4x faster than sequential
     for (let i = 0; i < segments.length; i += SCAN_CONCURRENCY) {
-      if (rateLimited) break;
+      if (rateLimited || cancelled) break;
       if (jobId) {
         const { data: jobCheck } = await supabase.from("scan_jobs").select("status").eq("id", jobId).single();
-        if (jobCheck?.status === "cancelled") { console.log(`[scan] job ${jobId} cancelled, stopping`); break; }
+        if (jobCheck?.status === "cancelled") {
+          cancelled = true;
+          console.log(`[scan] job ${jobId} cancelled, stopping`);
+          break;
+        }
       }
       const batch = segments.slice(i, i + SCAN_CONCURRENCY);
       await Promise.all(batch.map(async ({ start, duration }) => {
-        if (rateLimited) return;
+        if (rateLimited || cancelled) return;
         let audioPath;
         try {
           audioPath = await downloadSegment(streamUrl, start, duration, tmpDir);
+          // Re-check after download — skip AudD upload if cancelled while downloading
+          if (rateLimited || cancelled) return;
           const recognition = await recognizeWithAudd(audioPath, AUDD_API_TOKEN);
           samplesChecked++;
 
@@ -221,7 +228,7 @@ async function processVideo(video, dangerSongs, jobId, onBatchComplete, attempt 
       if (onBatchComplete) await onBatchComplete(batch.length);
     }
 
-    return { status: "done", rateLimited, matches, recognizedSongs, samplesChecked };
+    return { status: cancelled ? "cancelled" : "done", rateLimited, cancelled, matches, recognizedSongs, samplesChecked };
   } finally {
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
   }
@@ -297,6 +304,10 @@ async function processJob(jobId) {
         error: result.error || null,
       });
 
+      if (result.cancelled) {
+        console.log(`[scan] job ${jobId} cancelled inside video — stopping`);
+        break;
+      }
       if (result.rateLimited) {
         console.log(`[scan] AudD rate limit hit — stopping job ${jobId} early`);
         break;
