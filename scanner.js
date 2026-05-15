@@ -21,7 +21,7 @@ const SAMPLE_INTERVAL_SEC = 120;
 // Duration of each audio clip sent to AudD — 15s is optimal for their standard endpoint
 const SAMPLE_DURATION_SEC = 15;
 // How many segments to download + recognize simultaneously per video
-const SCAN_CONCURRENCY = 4;
+const SCAN_CONCURRENCY = 8;
 
 // Fetch all video IDs + durations from a YouTube playlist or single video URL
 async function resolveYouTubeUrl(url) {
