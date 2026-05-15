@@ -39,7 +39,7 @@ function resolveStreamUrl(videoUrl) {
 
 // Download one audio segment from an already-resolved CDN stream URL.
 async function downloadSegment(streamUrl, startSec, durationSec, tmpDir) {
-  const flacPath = path.join(tmpDir, `seg_${startSec}.flac`);
+  const flacPath = path.join(tmpDir, `seg_${startSec}.mp3`);
 
   const ffArgs = ["-ss", String(startSec), "-t", String(durationSec)];
   if (process.env.YTDLP_PROXY) ffArgs.push("-http_proxy", process.env.YTDLP_PROXY);
@@ -47,7 +47,8 @@ async function downloadSegment(streamUrl, startSec, durationSec, tmpDir) {
     "-i", streamUrl,
     "-ac", "1",
     "-ar", "22050",
-    "-c:a", "flac",
+    "-c:a", "libmp3lame",
+    "-q:a", "5",
     "-y", flacPath,
   );
 
@@ -73,13 +74,15 @@ async function downloadSegment(streamUrl, startSec, durationSec, tmpDir) {
 // Returns { title, artist } or null if no song recognized.
 function recognizeWithAudd(audioPath, apiToken) {
   const result = spawnSync("curl", [
-    "-s",
+    "-v",
     "-F", `api_token=${apiToken}`,
     "-F", `audio=@${audioPath}`,
     "https://api.audd.io/",
   ], { timeout: 30000, encoding: "utf8" });
 
-  console.log(`[audd-raw] exit=${result.status} stderr=${(result.stderr || "").slice(0, 100)} stdout=${(result.stdout || "").slice(0, 300)}`);
+  console.log(`[audd-raw] exit=${result.status}`);
+  console.log(`[audd-stderr] ${(result.stderr || "").slice(0, 600)}`);
+  console.log(`[audd-stdout] ${(result.stdout || "").slice(0, 300)}`);
 
   if (result.status !== 0 || !result.stdout?.trim()) {
     throw new Error(`AudD curl failed (exit ${result.status}): ${(result.stderr || "no output").slice(0, 200)}`);
