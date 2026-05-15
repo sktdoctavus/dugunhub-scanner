@@ -195,6 +195,7 @@ async function processVideo(video, dangerSongs, jobId, onBatchComplete, attempt 
                 song_artist: dangerSong.artist,
                 claimant: dangerSong.claimant,
                 detected_at_sec: start,
+                audd_timecode: recognition.timecode || null,
                 score: 100,
                 audd_title: recognition.title,
                 audd_artist: recognition.artist,
