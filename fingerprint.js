@@ -132,6 +132,8 @@ async function recognizeWithAudd(audioPath, apiToken) {
             artist: data.result.artist,
             album: data.result.album,
             timecode: data.result.timecode,
+            label: data.result.label,
+            song_link: data.result.song_link,
           });
         }
         resolve(null);
