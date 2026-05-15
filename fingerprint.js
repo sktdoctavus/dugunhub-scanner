@@ -2,6 +2,8 @@ const { execFile, execFileSync, spawnSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const https = require("https");
+const crypto = require("crypto");
 
 // Generate chromaprint fingerprint for an audio file — used for danger song approval only.
 function getFingerprintFromFile(audioPath) {
@@ -59,8 +61,8 @@ async function downloadSegment(streamUrl, startSec, durationSec, tmpDir) {
         reject(new Error(stderr || err.message));
       } else {
         const size = fs.existsSync(flacPath) ? fs.statSync(flacPath).size : 0;
-        console.log(`[ffmpeg] @${startSec}s → flac (${size} bytes)`);
-        if (size === 0) reject(new Error("ffmpeg produced empty FLAC"));
+        console.log(`[ffmpeg] @${startSec}s → mp3 (${size} bytes)`);
+        if (size === 0) reject(new Error("ffmpeg produced empty MP3"));
         else resolve();
       }
     });
@@ -69,41 +71,72 @@ async function downloadSegment(streamUrl, startSec, durationSec, tmpDir) {
   return flacPath;
 }
 
-// Send an audio file to AudD via curl — bypasses Node.js HTTP client
-// multipart issues entirely. curl -F handles file upload reliably.
+// Send an audio file to AudD via raw Node.js HTTPS — no curl, no redirects.
+// curl -F silently converts to GET on 301 redirects (dropping the body), which
+// is what api.audd.io does. https.request sends directly to the IP, no redirect.
 // Returns { title, artist } or null if no song recognized.
-function recognizeWithAudd(audioPath, apiToken) {
-  const result = spawnSync("curl", [
-    "-v",
-    "-F", `api_token=${apiToken}`,
-    "-F", `audio=@${audioPath}`,
-    "https://api.audd.io/",
-  ], { timeout: 30000, encoding: "utf8" });
+async function recognizeWithAudd(audioPath, apiToken) {
+  const boundary = crypto.randomBytes(16).toString("hex");
+  const CRLF = "\r\n";
 
-  console.log(`[audd-raw] exit=${result.status}`);
-  console.log(`[audd-stderr] ${(result.stderr || "").slice(0, 600)}`);
-  console.log(`[audd-stdout] ${(result.stdout || "").slice(0, 300)}`);
+  const fileData = fs.readFileSync(audioPath);
+  const fileName = path.basename(audioPath);
+  const fileSize = fileData.length;
+  console.log(`[audd] uploading ${fileName} (${fileSize} bytes)`);
 
-  if (result.status !== 0 || !result.stdout?.trim()) {
-    throw new Error(`AudD curl failed (exit ${result.status}): ${(result.stderr || "no output").slice(0, 200)}`);
-  }
+  const headerBuf = Buffer.from(
+    `--${boundary}${CRLF}` +
+    `Content-Disposition: form-data; name="api_token"${CRLF}${CRLF}` +
+    `${apiToken}${CRLF}` +
+    `--${boundary}${CRLF}` +
+    `Content-Disposition: form-data; name="audio"; filename="${fileName}"${CRLF}` +
+    `Content-Type: audio/mpeg${CRLF}${CRLF}`
+  );
+  const footerBuf = Buffer.from(`${CRLF}--${boundary}--${CRLF}`);
+  const body = Buffer.concat([headerBuf, fileData, footerBuf]);
 
-  const data = JSON.parse(result.stdout);
+  return new Promise((resolve, reject) => {
+    const req = https.request({
+      hostname: "api.audd.io",
+      port: 443,
+      path: "/",
+      method: "POST",
+      headers: {
+        "Content-Type": `multipart/form-data; boundary=${boundary}`,
+        "Content-Length": body.length,
+      },
+    }, (res) => {
+      console.log(`[audd] HTTP ${res.statusCode}`);
+      const chunks = [];
+      res.on("data", (c) => chunks.push(c));
+      res.on("end", () => {
+        const raw = Buffer.concat(chunks).toString("utf8");
+        console.log(`[audd-body] ${raw.slice(0, 400)}`);
+        let data;
+        try { data = JSON.parse(raw); }
+        catch (e) { return reject(new Error(`AudD non-JSON response: ${raw.slice(0, 200)}`)); }
 
-  if (data.status === "error") {
-    throw new Error(`AudD error: ${data.error?.error_message || JSON.stringify(data.error)}`);
-  }
-
-  if (data.status === "success" && data.result) {
-    return {
-      title: data.result.title,
-      artist: data.result.artist,
-      album: data.result.album,
-      timecode: data.result.timecode,
-    };
-  }
-
-  return null;
+        if (data.status === "error") {
+          return reject(new Error(`AudD error: ${data.error?.error_message || JSON.stringify(data.error)}`));
+        }
+        if (data.status === "success" && data.result) {
+          return resolve({
+            title: data.result.title,
+            artist: data.result.artist,
+            album: data.result.album,
+            timecode: data.result.timecode,
+          });
+        }
+        resolve(null);
+      });
+    });
+    req.on("error", (e) => {
+      console.error(`[audd-error] ${e.message}`);
+      reject(e);
+    });
+    req.write(body);
+    req.end();
+  });
 }
 
 module.exports = { getFingerprintFromFile, resolveStreamUrl, downloadSegment, recognizeWithAudd };
