@@ -142,6 +142,7 @@ async function processVideo(video, dangerSongs, attempt = 1) {
 
     const matches = [];
     const matchedSongIds = new Set();
+    const recognizedSongs = []; // every song AudD found, danger or not
     let samplesChecked = 0;
 
     for (let start = 0; start < video.durationSec; start += SAMPLE_INTERVAL_SEC) {
@@ -156,6 +157,11 @@ async function processVideo(video, dangerSongs, attempt = 1) {
 
         if (recognition) {
           console.log(`[audd] @${start}s: "${recognition.title}" by ${recognition.artist}`);
+          recognizedSongs.push({
+            at_sec: start,
+            title: recognition.title,
+            artist: recognition.artist,
+          });
           const dangerSong = matchesDangerSong(recognition, dangerSongs);
           if (dangerSong && !matchedSongIds.has(dangerSong.id)) {
             matchedSongIds.add(dangerSong.id);
@@ -181,7 +187,7 @@ async function processVideo(video, dangerSongs, attempt = 1) {
       }
     }
 
-    return { status: "done", matches, samplesChecked };
+    return { status: "done", matches, recognizedSongs, samplesChecked };
   } finally {
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
   }
@@ -228,6 +234,7 @@ async function processJob(jobId) {
         duration_sec: video.durationSec,
         status: result.status,
         matches: result.matches,
+        recognized_songs: result.recognizedSongs || [],
         error: result.error || null,
       });
 
