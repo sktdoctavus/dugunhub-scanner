@@ -124,7 +124,7 @@ function matchesDangerSong(recognition, dangerSongs) {
 }
 
 // Scan a single video with AudD — downloads 15s clips every 120s and recognizes each
-async function processVideo(video, dangerSongs, jobId, attempt = 1) {
+async function processVideo(video, dangerSongs, jobId, onBatchComplete, attempt = 1) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "dugunhub-"));
 
   try {
@@ -137,7 +137,7 @@ async function processVideo(video, dangerSongs, jobId, attempt = 1) {
       const blocked = e.message.includes("429") || e.message.includes("blocked") || e.message.includes("HTTP Error 403");
       if (blocked && attempt < MAX_RETRIES) {
         await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
-        return processVideo(video, dangerSongs, jobId, attempt + 1);
+        return processVideo(video, dangerSongs, jobId, onBatchComplete, attempt + 1);
       }
       return { status: "failed", error: e.message, matches: [] };
     }
@@ -202,6 +202,7 @@ async function processVideo(video, dangerSongs, jobId, attempt = 1) {
           if (audioPath && fs.existsSync(audioPath)) fs.unlinkSync(audioPath);
         }
       }));
+      if (onBatchComplete) await onBatchComplete(batch.length);
     }
 
     return { status: "done", matches, recognizedSongs, samplesChecked };
@@ -221,9 +222,20 @@ async function processJob(jobId) {
     const videos = await resolveYouTubeUrl(job.youtube_url);
     const totalDurationHours = videos.reduce((sum, v) => sum + v.durationSec / 3600, 0);
 
+    // Calculate total segments across all videos upfront for accurate progress
+    const totalSamples = videos.reduce((sum, v) => {
+      let count = 0;
+      for (let s = 0; s < v.durationSec; s += SAMPLE_INTERVAL_SEC) {
+        if (Math.min(SAMPLE_DURATION_SEC, v.durationSec - s) >= 5) count++;
+      }
+      return sum + count;
+    }, 0);
+
     await supabase.from("scan_jobs").update({
       total_videos: videos.length,
       total_hours: Math.round(totalDurationHours * 10) / 10,
+      total_samples: totalSamples,
+      progress_samples: 0,
     }).eq("id", jobId);
 
     // Deduct credits (hours) from user's scan balance
@@ -234,6 +246,12 @@ async function processJob(jobId) {
 
     const dangerSongs = await loadDangerSongs();
     const results = [];
+    let completedSamples = 0;
+
+    const onBatchComplete = async (count) => {
+      completedSamples += count;
+      await supabase.from("scan_jobs").update({ progress_samples: completedSamples }).eq("id", jobId);
+    };
 
     for (let i = 0; i < videos.length; i++) {
       const video = videos[i];
@@ -247,7 +265,7 @@ async function processJob(jobId) {
 
       await supabase.from("scan_jobs").update({ progress_title: video.title }).eq("id", jobId);
 
-      const result = await processVideo(video, dangerSongs, jobId);
+      const result = await processVideo(video, dangerSongs, jobId, onBatchComplete);
 
       await supabase.from("scan_jobs").update({ progress_video: i + 1 }).eq("id", jobId);
 
