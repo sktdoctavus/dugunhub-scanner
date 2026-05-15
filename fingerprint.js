@@ -124,6 +124,12 @@ async function recognizeWithAudd(audioPath, apiToken) {
         catch (e) { return reject(new Error(`AudD non-JSON response: ${raw.slice(0, 200)}`)); }
 
         if (data.status === "error") {
+          // error_code 902 = monthly recognition limit exhausted
+          if (data.error?.error_code === 902) {
+            const err = new Error("AudD recognition limit reached");
+            err.code = "AUDD_RATE_LIMIT";
+            return reject(err);
+          }
           return reject(new Error(`AudD error: ${data.error?.error_message || JSON.stringify(data.error)}`));
         }
         if (data.status === "success" && data.result) {
