@@ -20,6 +20,8 @@ const RETRY_DELAY_MS = 300000;
 const SAMPLE_INTERVAL_SEC = 120;
 // Duration of each audio clip sent to AudD — 15s is optimal for their standard endpoint
 const SAMPLE_DURATION_SEC = 15;
+// How many segments to download + recognize simultaneously per video
+const SCAN_CONCURRENCY = 4;
 
 // Fetch all video IDs + durations from a YouTube playlist or single video URL
 async function resolveYouTubeUrl(url) {
@@ -145,46 +147,51 @@ async function processVideo(video, dangerSongs, attempt = 1) {
     const recognizedSongs = []; // every song AudD found, danger or not
     let samplesChecked = 0;
 
+    // Build the full list of segments to check
+    const segments = [];
     for (let start = 0; start < video.durationSec; start += SAMPLE_INTERVAL_SEC) {
       const duration = Math.min(SAMPLE_DURATION_SEC, video.durationSec - start);
       if (duration < 5) break;
+      segments.push({ start, duration });
+    }
 
-      let audioPath;
-      try {
-        audioPath = await downloadSegment(streamUrl, start, duration, tmpDir);
-        const recognition = await recognizeWithAudd(audioPath, AUDD_API_TOKEN);
-        samplesChecked++;
+    // Process SCAN_CONCURRENCY segments at a time — ~4x faster than sequential
+    for (let i = 0; i < segments.length; i += SCAN_CONCURRENCY) {
+      const batch = segments.slice(i, i + SCAN_CONCURRENCY);
+      await Promise.all(batch.map(async ({ start, duration }) => {
+        let audioPath;
+        try {
+          audioPath = await downloadSegment(streamUrl, start, duration, tmpDir);
+          const recognition = await recognizeWithAudd(audioPath, AUDD_API_TOKEN);
+          samplesChecked++;
 
-        if (recognition) {
-          console.log(`[audd] @${start}s: "${recognition.title}" by ${recognition.artist}`);
-          recognizedSongs.push({
-            at_sec: start,
-            title: recognition.title,
-            artist: recognition.artist,
-          });
-          const dangerSong = matchesDangerSong(recognition, dangerSongs);
-          if (dangerSong && !matchedSongIds.has(dangerSong.id)) {
-            matchedSongIds.add(dangerSong.id);
-            console.log(`[audd] MATCH: "${dangerSong.title}" at ${start}s`);
-            matches.push({
-              song_id: dangerSong.id,
-              song_title: dangerSong.title,
-              song_artist: dangerSong.artist,
-              claimant: dangerSong.claimant,
-              detected_at_sec: start,
-              score: 100,
-              audd_title: recognition.title,
-              audd_artist: recognition.artist,
-            });
+          if (recognition) {
+            console.log(`[audd] @${start}s: "${recognition.title}" by ${recognition.artist}`);
+            recognizedSongs.push({ at_sec: start, title: recognition.title, artist: recognition.artist });
+            const dangerSong = matchesDangerSong(recognition, dangerSongs);
+            if (dangerSong && !matchedSongIds.has(dangerSong.id)) {
+              matchedSongIds.add(dangerSong.id);
+              console.log(`[audd] MATCH: "${dangerSong.title}" at ${start}s`);
+              matches.push({
+                song_id: dangerSong.id,
+                song_title: dangerSong.title,
+                song_artist: dangerSong.artist,
+                claimant: dangerSong.claimant,
+                detected_at_sec: start,
+                score: 100,
+                audd_title: recognition.title,
+                audd_artist: recognition.artist,
+              });
+            }
+          } else {
+            console.log(`[audd] @${start}s: no match`);
           }
-        } else {
-          console.log(`[audd] @${start}s: no match`);
+        } catch (e) {
+          console.error(`[audd] @${start}s FAILED: ${e.message.slice(0, 500)}`);
+        } finally {
+          if (audioPath && fs.existsSync(audioPath)) fs.unlinkSync(audioPath);
         }
-      } catch (e) {
-        console.error(`[audd] @${start}s FAILED: ${e.message.slice(0, 500)}`);
-      } finally {
-        if (audioPath && fs.existsSync(audioPath)) fs.unlinkSync(audioPath);
-      }
+      }));
     }
 
     return { status: "done", matches, recognizedSongs, samplesChecked };
