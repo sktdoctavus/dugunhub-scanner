@@ -276,6 +276,8 @@ async function processJob(jobId) {
       await supabase.from("scan_jobs").update({ progress_samples: completedSamples }).eq("id", jobId);
     };
 
+    const processedVideoIds = new Set();
+
     for (let i = 0; i < videos.length; i++) {
       const video = videos[i];
 
@@ -290,6 +292,7 @@ async function processJob(jobId) {
 
       const result = await processVideo(video, dangerSongs, jobId, onBatchComplete);
 
+      processedVideoIds.add(video.id);
       await supabase.from("scan_jobs").update({ progress_video: i + 1 }).eq("id", jobId);
 
       results.push({
@@ -301,6 +304,7 @@ async function processJob(jobId) {
         matches: result.matches,
         recognized_songs: result.recognizedSongs || [],
         rate_limited: result.rateLimited || false,
+        samples_checked: result.samplesChecked || 0,
         error: result.error || null,
       });
 
@@ -323,6 +327,26 @@ async function processJob(jobId) {
     if (finalCheck?.status === "cancelled") {
       console.log(`[scan] job ${jobId} finished as cancelled`);
       return;
+    }
+
+    // Refund hours for: (a) videos rate-limited before any sample was checked,
+    // and (b) videos never reached because the scan aborted early.
+    let refundHours = 0;
+    for (const video of videos) {
+      if (!processedVideoIds.has(video.id)) {
+        // Never processed — full refund
+        refundHours += video.durationSec / 3600;
+      } else {
+        const res = results.find((r) => r.video_id === video.id);
+        if (res?.rate_limited && res.samples_checked === 0) {
+          // Processed but AudD was already exhausted — full refund for this video
+          refundHours += video.durationSec / 3600;
+        }
+      }
+    }
+    if (refundHours > 0) {
+      console.log(`[scan] refunding ${refundHours.toFixed(2)}h to user ${job.user_id}`);
+      await supabase.rpc("refund_scan_hours", { p_user_id: job.user_id, p_hours: refundHours });
     }
 
     const totalMatches = results.reduce((sum, r) => sum + r.matches.length, 0);
