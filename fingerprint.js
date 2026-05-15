@@ -84,6 +84,13 @@ async function recognizeWithAudd(audioPath, apiToken) {
   const fileSize = fileData.length;
   console.log(`[audd] uploading ${fileName} (${fileSize} bytes)`);
 
+  // Skip near-empty files — ffmpeg at end-of-stream produces ~227 bytes (headers only)
+  // AudD returns error_code 300 for these, which pollutes logs and wastes a credit
+  if (fileSize < 2000) {
+    console.log(`[audd] skipping ${fileName} — too small, likely empty segment`);
+    return null;
+  }
+
   const headerBuf = Buffer.from(
     `--${boundary}${CRLF}` +
     `Content-Disposition: form-data; name="api_token"${CRLF}${CRLF}` +

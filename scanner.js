@@ -177,7 +177,7 @@ async function processVideo(video, dangerSongs, jobId, onBatchComplete, attempt 
 
           if (recognition) {
             console.log(`[audd] @${start}s: "${recognition.title}" by ${recognition.artist}`);
-            recognizedSongs.push({ at_sec: start, title: recognition.title, artist: recognition.artist });
+            recognizedSongs.push({ at_sec: start, title: recognition.title, artist: recognition.artist, timecode: recognition.timecode || null });
             const dangerSong = matchesDangerSong(recognition, dangerSongs);
             if (dangerSong && !matchedSongIds.has(dangerSong.id)) {
               matchedSongIds.add(dangerSong.id);
