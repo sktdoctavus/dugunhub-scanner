@@ -124,7 +124,7 @@ function matchesDangerSong(recognition, dangerSongs) {
 }
 
 // Scan a single video with AudD — downloads 15s clips every 120s and recognizes each
-async function processVideo(video, dangerSongs, attempt = 1) {
+async function processVideo(video, dangerSongs, jobId, attempt = 1) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "dugunhub-"));
 
   try {
@@ -137,9 +137,15 @@ async function processVideo(video, dangerSongs, attempt = 1) {
       const blocked = e.message.includes("429") || e.message.includes("blocked") || e.message.includes("HTTP Error 403");
       if (blocked && attempt < MAX_RETRIES) {
         await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
-        return processVideo(video, dangerSongs, attempt + 1);
+        return processVideo(video, dangerSongs, jobId, attempt + 1);
       }
       return { status: "failed", error: e.message, matches: [] };
+    }
+
+    // Check if cancelled before we even start sampling
+    if (jobId) {
+      const { data: jobCheck } = await supabase.from("scan_jobs").select("status").eq("id", jobId).single();
+      if (jobCheck?.status === "cancelled") return { status: "cancelled", matches: [], recognizedSongs: [], samplesChecked: 0 };
     }
 
     const matches = [];
@@ -157,6 +163,10 @@ async function processVideo(video, dangerSongs, attempt = 1) {
 
     // Process SCAN_CONCURRENCY segments at a time — ~4x faster than sequential
     for (let i = 0; i < segments.length; i += SCAN_CONCURRENCY) {
+      if (jobId) {
+        const { data: jobCheck } = await supabase.from("scan_jobs").select("status").eq("id", jobId).single();
+        if (jobCheck?.status === "cancelled") { console.log(`[scan] job ${jobId} cancelled, stopping`); break; }
+      }
       const batch = segments.slice(i, i + SCAN_CONCURRENCY);
       await Promise.all(batch.map(async ({ start, duration }) => {
         let audioPath;
@@ -228,9 +238,16 @@ async function processJob(jobId) {
     for (let i = 0; i < videos.length; i++) {
       const video = videos[i];
 
+      // Check cancellation before each video
+      const { data: jobCheck } = await supabase.from("scan_jobs").select("status").eq("id", jobId).single();
+      if (jobCheck?.status === "cancelled") {
+        console.log(`[scan] job ${jobId} cancelled between videos`);
+        break;
+      }
+
       await supabase.from("scan_jobs").update({ progress_title: video.title }).eq("id", jobId);
 
-      const result = await processVideo(video, dangerSongs);
+      const result = await processVideo(video, dangerSongs, jobId);
 
       await supabase.from("scan_jobs").update({ progress_video: i + 1 }).eq("id", jobId);
 
@@ -248,6 +265,13 @@ async function processJob(jobId) {
       if (i < videos.length - 1) {
         await new Promise((r) => setTimeout(r, DELAY_BETWEEN_VIDEOS_MS));
       }
+    }
+
+    // Check if cancelled (may have been set during last video)
+    const { data: finalCheck } = await supabase.from("scan_jobs").select("status").eq("id", jobId).single();
+    if (finalCheck?.status === "cancelled") {
+      console.log(`[scan] job ${jobId} finished as cancelled`);
+      return;
     }
 
     const totalMatches = results.reduce((sum, r) => sum + r.matches.length, 0);
