@@ -107,18 +107,31 @@ function normalize(str) {
     .trim();
 }
 
-// Check if an AudD recognition result matches any danger song by title
+// Check if an AudD recognition result matches any danger song by title + artist
 function matchesDangerSong(recognition, dangerSongs) {
   if (!recognition?.title) return null;
   const recTitle = normalize(recognition.title);
+  const recArtist = normalize(recognition.artist);
 
   for (const song of dangerSongs) {
     const songTitle = normalize(song.title);
-    if (recTitle === songTitle ||
-        recTitle.includes(songTitle) ||
-        songTitle.includes(recTitle)) {
-      return song;
+    const titleMatch =
+      recTitle === songTitle ||
+      recTitle.includes(songTitle) ||
+      songTitle.includes(recTitle);
+    if (!titleMatch) continue;
+
+    // When both sides have artist info, require artist match too
+    const songArtist = normalize(song.artist);
+    if (songArtist && recArtist) {
+      const artistMatch =
+        recArtist === songArtist ||
+        recArtist.includes(songArtist) ||
+        songArtist.includes(recArtist);
+      if (!artistMatch) continue;
     }
+
+    return song;
   }
   return null;
 }
