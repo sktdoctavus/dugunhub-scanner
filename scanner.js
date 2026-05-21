@@ -25,7 +25,7 @@ const SCAN_CONCURRENCY = 8;
 
 // Fetch all video IDs + durations from a YouTube playlist or single video URL
 async function resolveYouTubeUrl(url) {
-  const videoMatch = url.match(/(?:v=|youtu\.be\/)([A-Za-z0-9_-]{11})/);
+  const videoMatch = url.match(/(?:v=|youtu\.be\/|\/live\/)([A-Za-z0-9_-]{11})/);
   const playlistMatch = url.match(/[?&]list=([A-Za-z0-9_-]+)/);
 
   // RD/WL/LL/FL prefixes are auto-generated YouTube mixes — not real playlists,
