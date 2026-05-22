@@ -85,7 +85,7 @@ function parseDuration(iso) {
   return (parseInt(m[1] || 0) * 3600) + (parseInt(m[2] || 0) * 60) + parseInt(m[3] || 0);
 }
 
-// Load all approved danger songs from Supabase
+// Load all approved danger songs from Supabase (title/artist matching, for full AudD scan)
 async function loadDangerSongs() {
   const { data, error } = await supabase
     .from("danger_songs")
@@ -94,6 +94,55 @@ async function loadDangerSongs() {
 
   if (error) throw new Error(`Failed to load danger songs: ${error.message}`);
   return data || [];
+}
+
+// Load danger songs that have stored fingerprints (for local fingerprint-only scan)
+async function loadDangerSongsWithFingerprints() {
+  const { data, error } = await supabase
+    .from("danger_songs")
+    .select("id, title, artist, claimant, fingerprint")
+    .eq("approved", true)
+    .eq("match_type", "song")
+    .not("fingerprint", "is", null);
+
+  if (error) throw new Error(`Failed to load danger songs: ${error.message}`);
+  return (data || []).filter((s) => Array.isArray(s.fingerprint) && s.fingerprint.length > 0);
+}
+
+// Compute minimum BER between a short clip fingerprint and a longer song fingerprint
+// using a sliding window. Returns 0 (perfect match) to 1 (no match).
+function computeMinBER(clipFp, songFp) {
+  if (!clipFp?.length || !songFp?.length) return 1;
+  const [shortFp, longFp] = clipFp.length <= songFp.length ? [clipFp, songFp] : [songFp, clipFp];
+  const wSize = shortFp.length;
+  const totalBits = wSize * 32;
+  let minBER = 1;
+
+  for (let offset = 0; offset <= longFp.length - wSize; offset++) {
+    let diffBits = 0;
+    for (let i = 0; i < wSize; i++) {
+      let x = ((shortFp[i] ^ longFp[offset + i]) >>> 0);
+      // Hamming weight (popcount)
+      x = x - ((x >>> 1) & 0x55555555);
+      x = (x & 0x33333333) + ((x >>> 2) & 0x33333333);
+      x = (x + (x >>> 4)) & 0x0f0f0f0f;
+      diffBits += (x * 0x01010101) >>> 24;
+    }
+    const ber = diffBits / totalBits;
+    if (ber < minBER) minBER = ber;
+    if (minBER < 0.1) break; // great match — early exit
+  }
+  return minBER;
+}
+
+// Find the best-matching danger song for a clip fingerprint. Returns { song, ber } or null.
+function matchFingerprintToDangerSongs(clipFp, dangerSongs, threshold = 0.35) {
+  let best = null;
+  for (const song of dangerSongs) {
+    const ber = computeMinBER(clipFp, song.fingerprint);
+    if (ber < threshold && (!best || ber < best.ber)) best = { song, ber };
+  }
+  return best;
 }
 
 // Normalize a string for fuzzy comparison: lowercase, strip diacritics and punctuation
@@ -256,6 +305,85 @@ async function processVideo(video, dangerSongs, jobId, onBatchComplete, attempt 
   }
 }
 
+// Local-only scan: compare audio fingerprints against stored danger song fingerprints (no AudD)
+async function processVideoLocal(video, dangerSongs, jobId, onBatchComplete) {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "dugunhub-local-"));
+  try {
+    let streamUrl;
+    try {
+      console.log(`[local] resolving stream URL for "${video.title}"...`);
+      streamUrl = resolveStreamUrl(video.url);
+    } catch (e) {
+      return { status: "failed", error: e.message, matches: [], samplesChecked: 0 };
+    }
+
+    if (jobId) {
+      const { data: jobCheck } = await supabase.from("scan_jobs").select("status").eq("id", jobId).single();
+      if (jobCheck?.status === "cancelled") return { status: "cancelled", matches: [], samplesChecked: 0 };
+    }
+
+    const matches = [];
+    const matchedSongIds = new Set();
+    let samplesChecked = 0;
+    let cancelled = false;
+
+    const segments = [];
+    for (let start = 0; start < video.durationSec; start += SAMPLE_INTERVAL_SEC) {
+      const duration = Math.min(SAMPLE_DURATION_SEC, video.durationSec - start);
+      if (duration < 5) break;
+      segments.push({ start, duration });
+    }
+
+    for (let i = 0; i < segments.length; i += SCAN_CONCURRENCY) {
+      if (cancelled) break;
+      if (jobId) {
+        const { data: jobCheck } = await supabase.from("scan_jobs").select("status").eq("id", jobId).single();
+        if (jobCheck?.status === "cancelled") { cancelled = true; break; }
+      }
+      const batch = segments.slice(i, i + SCAN_CONCURRENCY);
+      await Promise.all(batch.map(async ({ start, duration }) => {
+        if (cancelled) return;
+        let audioPath;
+        try {
+          audioPath = await downloadSegment(streamUrl, start, duration, tmpDir);
+          if (cancelled) return;
+          const { fingerprint: clipFp } = getFingerprintFromFile(audioPath);
+          samplesChecked++;
+          const hit = matchFingerprintToDangerSongs(clipFp, dangerSongs);
+          if (hit && !matchedSongIds.has(hit.song.id)) {
+            matchedSongIds.add(hit.song.id);
+            const score = Math.round((1 - hit.ber) * 100);
+            console.log(`[local] @${start}s: MATCH "${hit.song.title}" BER=${hit.ber.toFixed(3)} score=${score}`);
+            matches.push({
+              song_id: hit.song.id,
+              song_title: hit.song.title,
+              song_artist: hit.song.artist,
+              claimant: hit.song.claimant,
+              match_type: "song",
+              detected_at_sec: start,
+              audd_timecode: null,
+              score,
+              audd_title: null,
+              audd_artist: null,
+            });
+          } else if (!hit) {
+            console.log(`[local] @${start}s: no match`);
+          }
+        } catch (e) {
+          console.error(`[local] @${start}s FAILED: ${e.message.slice(0, 300)}`);
+        } finally {
+          if (audioPath && fs.existsSync(audioPath)) fs.unlinkSync(audioPath);
+        }
+      }));
+      if (onBatchComplete) await onBatchComplete(batch.length);
+    }
+
+    return { status: cancelled ? "cancelled" : "done", cancelled, matches, recognizedSongs: [], samplesChecked, rateLimited: false };
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+  }
+}
+
 // Main scan job processor
 async function processJob(jobId) {
   await supabase.from("scan_jobs").update({ status: "running", started_at: new Date().toISOString() }).eq("id", jobId);
@@ -283,13 +411,23 @@ async function processJob(jobId) {
       progress_samples: 0,
     }).eq("id", jobId);
 
-    // Deduct credits (hours) from user's scan balance
-    await supabase.rpc("deduct_scan_hours", {
-      p_user_id: job.user_id,
-      p_hours: totalDurationHours,
-    });
+    const isLocal = job.scan_mode === "local";
 
-    const dangerSongs = await loadDangerSongs();
+    // Deduct credits only for full AudD scans
+    if (!isLocal) {
+      await supabase.rpc("deduct_scan_hours", {
+        p_user_id: job.user_id,
+        p_hours: totalDurationHours,
+      });
+    }
+
+    const dangerSongs = isLocal
+      ? await loadDangerSongsWithFingerprints()
+      : await loadDangerSongs();
+
+    if (isLocal) {
+      console.log(`[scan] local mode — ${dangerSongs.length} songs with fingerprints loaded`);
+    }
     const results = [];
     let completedSamples = 0;
 
@@ -312,7 +450,9 @@ async function processJob(jobId) {
 
       await supabase.from("scan_jobs").update({ progress_title: video.title }).eq("id", jobId);
 
-      const result = await processVideo(video, dangerSongs, jobId, onBatchComplete);
+      const result = isLocal
+        ? await processVideoLocal(video, dangerSongs, jobId, onBatchComplete)
+        : await processVideo(video, dangerSongs, jobId, onBatchComplete);
 
       processedVideoIds.add(video.id);
       await supabase.from("scan_jobs").update({ progress_video: i + 1 }).eq("id", jobId);
@@ -351,24 +491,23 @@ async function processJob(jobId) {
       return;
     }
 
-    // Refund hours for: (a) videos rate-limited before any sample was checked,
-    // and (b) videos never reached because the scan aborted early.
-    let refundHours = 0;
-    for (const video of videos) {
-      if (!processedVideoIds.has(video.id)) {
-        // Never processed — full refund
-        refundHours += video.durationSec / 3600;
-      } else {
-        const res = results.find((r) => r.video_id === video.id);
-        if (res?.rate_limited && res.samples_checked === 0) {
-          // Processed but AudD was already exhausted — full refund for this video
+    // Refund hours only for full AudD scans (local scans never deduct credits)
+    if (!isLocal) {
+      let refundHours = 0;
+      for (const video of videos) {
+        if (!processedVideoIds.has(video.id)) {
           refundHours += video.durationSec / 3600;
+        } else {
+          const res = results.find((r) => r.video_id === video.id);
+          if (res?.rate_limited && res.samples_checked === 0) {
+            refundHours += video.durationSec / 3600;
+          }
         }
       }
-    }
-    if (refundHours > 0) {
-      console.log(`[scan] refunding ${refundHours.toFixed(2)}h to user ${job.user_id}`);
-      await supabase.rpc("refund_scan_hours", { p_user_id: job.user_id, p_hours: refundHours });
+      if (refundHours > 0) {
+        console.log(`[scan] refunding ${refundHours.toFixed(2)}h to user ${job.user_id}`);
+        await supabase.rpc("refund_scan_hours", { p_user_id: job.user_id, p_hours: refundHours });
+      }
     }
 
     const totalMatches = results.reduce((sum, r) => sum + r.matches.length, 0);
