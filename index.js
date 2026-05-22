@@ -1,5 +1,6 @@
 const express = require("express");
-const { processJob, resolveYouTubeUrl, fingerprintDangerSong, debugMatch } = require("./scanner");
+const { processJob, resolveYouTubeUrl, fingerprintDangerSong, debugMatch, resolveChannelUrl } = require("./scanner");
+const axios = require("axios");
 const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
@@ -73,6 +74,59 @@ app.post("/debug-match", auth, async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+
+// List videos from a YouTube channel — paginated, 50 per page
+// Returns { videos: [{id, title, durationSec, channelTitle, channelId}], nextPageToken }
+app.post("/channel-videos", auth, async (req, res) => {
+  const { channelUrl, pageToken } = req.body;
+  if (!channelUrl) return res.status(400).json({ error: "channelUrl required" });
+
+  try {
+    const { uploadsPlaylistId, channelTitle, channelId } = await resolveChannelUrl(channelUrl);
+
+    const itemsRes = await axios.get("https://www.googleapis.com/youtube/v3/playlistItems", {
+      params: {
+        part: "contentDetails",
+        playlistId: uploadsPlaylistId,
+        maxResults: 50,
+        pageToken: pageToken || undefined,
+        key: process.env.YOUTUBE_API_KEY,
+      },
+    });
+
+    const videoIds = itemsRes.data.items.map((i) => i.contentDetails.videoId);
+    const detailsRes = await axios.get("https://www.googleapis.com/youtube/v3/videos", {
+      params: {
+        part: "contentDetails,snippet",
+        id: videoIds.join(","),
+        key: process.env.YOUTUBE_API_KEY,
+      },
+    });
+
+    const videos = detailsRes.data.items.map((v) => ({
+      id: v.id,
+      title: v.snippet.title,
+      durationSec: parseDurationISO(v.contentDetails.duration),
+      channelTitle: v.snippet.channelTitle || channelTitle,
+      channelId: v.snippet.channelId || channelId,
+    }));
+
+    res.json({
+      videos,
+      channelTitle,
+      channelId,
+      nextPageToken: itemsRes.data.nextPageToken || null,
+    });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+function parseDurationISO(iso) {
+  const m = iso.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
+  if (!m) return 0;
+  return (parseInt(m[1] || 0) * 3600) + (parseInt(m[2] || 0) * 60) + parseInt(m[3] || 0);
+}
 
 // Start a scan job — job must already exist in Supabase scan_jobs table
 app.post("/scan", auth, async (req, res) => {

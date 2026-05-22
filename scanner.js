@@ -76,7 +76,52 @@ async function fetchVideoDetails(videoIds) {
     title: v.snippet.title,
     durationSec: parseDuration(v.contentDetails.duration),
     url: `https://www.youtube.com/watch?v=${v.id}`,
+    channelTitle: v.snippet.channelTitle || null,
+    channelId: v.snippet.channelId || null,
   }));
+}
+
+// Fetch the uploads playlist ID for a channel (used by resolveChannelUrl)
+async function fetchChannelUploadsPlaylistId({ forHandle, id, forUsername }) {
+  const params = { part: "contentDetails,snippet", maxResults: 1, key: YOUTUBE_API_KEY };
+  if (forHandle) params.forHandle = forHandle;
+  else if (id) params.id = id;
+  else if (forUsername) params.forUsername = forUsername;
+  else throw new Error("fetchChannelUploadsPlaylistId: no channel selector provided");
+
+  const res = await axios.get("https://www.googleapis.com/youtube/v3/channels", { params });
+  const item = res.data.items?.[0];
+  if (!item) throw new Error("Channel not found");
+  return {
+    uploadsPlaylistId: item.contentDetails.relatedPlaylists.uploads,
+    channelTitle: item.snippet.title,
+    channelId: item.id,
+  };
+}
+
+// Resolve any YouTube channel URL to { uploadsPlaylistId, channelTitle, channelId }
+async function resolveChannelUrl(url) {
+  const u = new URL(url);
+  const parts = u.pathname.split("/").filter(Boolean);
+
+  if (parts[0] === "channel" && parts[1]) {
+    return fetchChannelUploadsPlaylistId({ id: parts[1] });
+  }
+  if (parts[0] === "c" && parts[1]) {
+    return fetchChannelUploadsPlaylistId({ forHandle: parts[1] });
+  }
+  if (parts[0] === "user" && parts[1]) {
+    return fetchChannelUploadsPlaylistId({ forUsername: parts[1] });
+  }
+  if (parts[0]?.startsWith("@")) {
+    return fetchChannelUploadsPlaylistId({ forHandle: parts[0].slice(1) });
+  }
+  // URL path like /@Handle
+  const handleMatch = u.pathname.match(/^\/@(.+)/);
+  if (handleMatch) {
+    return fetchChannelUploadsPlaylistId({ forHandle: handleMatch[1] });
+  }
+  throw new Error("Could not parse channel URL");
 }
 
 // ISO 8601 duration (PT1H30M15S) → seconds
@@ -528,8 +573,50 @@ async function processJob(jobId) {
   }
 }
 
+// Extract fingerprint for a danger_song that was added via YouTube URL (no Storage upload)
+async function fingerprintDangerSongFromYouTube(songId) {
+  const setNote = (msg) => supabase.from("danger_songs").update({ notes: `[fp] ${msg}` }).eq("id", songId).then(() => {});
+
+  await setNote("started (youtube path)");
+
+  const { data: song, error } = await supabase
+    .from("danger_songs")
+    .select("id, title, youtube_video_id")
+    .eq("id", songId)
+    .single();
+  if (error || !song) throw new Error(`Song not found: ${error?.message}`);
+  if (!song.youtube_video_id) throw new Error("No youtube_video_id on this song.");
+
+  const videoUrl = `https://www.youtube.com/watch?v=${song.youtube_video_id}`;
+  await setNote(`resolving stream: ${videoUrl}`);
+
+  const streamUrl = resolveStreamUrl(videoUrl);
+  await setNote("downloading 120s segment");
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "dh-yt-fp-"));
+  try {
+    const audioPath = await downloadSegment(streamUrl, 0, 120, tmpDir);
+    await setNote("running fpcalc");
+
+    const { fingerprint: rawFp, duration } = getFingerprintFromFile(audioPath);
+    const fingerprint = rawFp.map((v) => (v > 2147483647 ? v - 4294967296 : v));
+    await setNote(`fpcalc done, fp length ${fingerprint.length}, saving`);
+
+    const { error: updateErr } = await supabase.from("danger_songs").update({
+      fingerprint,
+      duration,
+      notes: null,
+    }).eq("id", songId);
+    if (updateErr) throw new Error(`DB update failed: ${updateErr.message}`);
+
+    return { success: true, fingerprintLength: fingerprint.length };
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true }); } catch {}
+  }
+}
+
 // Extract and store chromaprint fingerprint for a danger_song from its uploaded audio file.
-// The fingerprint is kept for historical reference; AudD title/artist matching is now used for scanning.
+// Routes to fingerprintDangerSongFromYouTube when the song has a youtube_video_id and no submission.
 async function fingerprintDangerSong(songId) {
   const setNote = (msg) => supabase.from("danger_songs").update({ notes: `[fp] ${msg}` }).eq("id", songId).then(() => {});
 
@@ -537,10 +624,16 @@ async function fingerprintDangerSong(songId) {
 
   const { data: song, error } = await supabase
     .from("danger_songs")
-    .select("id, title, submission_id")
+    .select("id, title, submission_id, youtube_video_id")
     .eq("id", songId)
     .single();
   if (error || !song) throw new Error(`Song not found: ${error?.message}`);
+
+  // Route to YouTube path when no uploaded audio file exists
+  if (song.youtube_video_id && !song.submission_id) {
+    return fingerprintDangerSongFromYouTube(songId);
+  }
+
   if (!song.submission_id) throw new Error("No submission linked to this song.");
 
   await setNote("fetching submission");
@@ -607,4 +700,4 @@ async function debugMatch(youtubeUrl, startSec = 0) {
   }
 }
 
-module.exports = { processJob, resolveYouTubeUrl, fingerprintDangerSong, debugMatch };
+module.exports = { processJob, resolveYouTubeUrl, fingerprintDangerSong, debugMatch, resolveChannelUrl };
