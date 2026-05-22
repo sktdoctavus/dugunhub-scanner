@@ -1,5 +1,5 @@
 const express = require("express");
-const { processJob, resolveYouTubeUrl, fingerprintDangerSong, debugMatch, resolveChannelUrl } = require("./scanner");
+const { processJob, resolveYouTubeUrl, fingerprintDangerSong, debugMatch, resolveChannelUrl, ytMetaScan } = require("./scanner");
 const axios = require("axios");
 const { createClient } = require("@supabase/supabase-js");
 
@@ -129,6 +129,19 @@ function parseDurationISO(iso) {
   if (!m) return 0;
   return (parseInt(m[1] || 0) * 3600) + (parseInt(m[2] || 0) * 60) + parseInt(m[3] || 0);
 }
+
+// YouTube metadata scan: extract Content ID music data from a video/channel/playlist
+// and compare against danger_songs. No audio download, no AudD — near-zero cost.
+app.post("/yt-meta-scan", auth, async (req, res) => {
+  const { youtubeUrl } = req.body;
+  if (!youtubeUrl) return res.status(400).json({ error: "youtubeUrl required" });
+  try {
+    const result = await ytMetaScan(youtubeUrl);
+    res.json(result);
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
 
 // Start a scan job — job must already exist in Supabase scan_jobs table
 app.post("/scan", auth, async (req, res) => {

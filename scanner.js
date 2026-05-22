@@ -1,5 +1,6 @@
 const { createClient } = require("@supabase/supabase-js");
 const { getFingerprintFromFile, resolveStreamUrl, downloadSegment, recognizeWithAudd } = require("./fingerprint");
+const { spawnSync } = require("child_process");
 const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
@@ -701,4 +702,88 @@ async function debugMatch(youtubeUrl, startSec = 0) {
   }
 }
 
-module.exports = { processJob, resolveYouTubeUrl, fingerprintDangerSong, debugMatch, resolveChannelUrl };
+// Extract the "Music in this video" tracks that YouTube detected for a single video.
+// Uses yt-dlp -j (metadata only, no download). Returns [{title, artist, album}].
+function extractYtMusicTracks(videoId) {
+  const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
+  const args = [
+    "--skip-download", "--no-playlist", "-j",
+    "--extractor-args", "youtube:player_client=tv_embedded,web_embedded,android_vr,android",
+  ];
+  if (process.env.YTDLP_PROXY) args.push("--proxy", process.env.YTDLP_PROXY);
+  args.push(videoUrl);
+
+  const result = spawnSync("yt-dlp", args, { timeout: 30000, encoding: "utf8" });
+  if (result.status !== 0 || !result.stdout?.trim()) return [];
+
+  let info;
+  try { info = JSON.parse(result.stdout); } catch { return []; }
+
+  const tracks = [];
+
+  // yt-dlp stores the "Music in this video" panel as info.music — keys may be capitalized
+  if (Array.isArray(info.music)) {
+    for (const m of info.music) {
+      const title  = m.track  || m.Track  || m.Song   || m.song   || null;
+      const artist = m.artist || m.Artist || null;
+      const album  = m.album  || m.Album  || null;
+      if (title || artist) tracks.push({ title, artist, album });
+    }
+  }
+
+  // Fallback: single-track music videos expose top-level track/artist fields
+  if (tracks.length === 0 && (info.track || info.artist)) {
+    tracks.push({ title: info.track || null, artist: info.artist || null, album: info.album || null });
+  }
+
+  return tracks;
+}
+
+// YouTube-metadata-based scan: resolves a URL to videos, extracts Content ID music data,
+// compares against danger_songs — no audio download, no AudD call needed.
+async function ytMetaScan(youtubeUrl) {
+  const videos = await resolveYouTubeUrl(youtubeUrl);
+  const dangerSongs = await loadDangerSongs();
+
+  const CONCURRENCY = 5;
+  const results = [];
+
+  for (let i = 0; i < videos.length; i += CONCURRENCY) {
+    const batch = videos.slice(i, i + CONCURRENCY);
+    const batchResults = await Promise.all(batch.map((video) => {
+      const detectedTracks = extractYtMusicTracks(video.id);
+      const dangerousMatches = [];
+      for (const track of detectedTracks) {
+        const hit = matchesDangerSong(track, dangerSongs);
+        if (hit) {
+          dangerousMatches.push({
+            danger_song_id: hit.id,
+            title: hit.title,
+            artist: hit.artist,
+            claimant: hit.claimant,
+            match_type: hit.match_type || "song",
+            detected_title: track.title,
+            detected_artist: track.artist,
+          });
+        }
+      }
+      return {
+        video_id: video.id,
+        video_title: video.title,
+        video_url: video.url,
+        duration_sec: video.durationSec,
+        detected_tracks: detectedTracks,
+        dangerous_matches: dangerousMatches,
+      };
+    }));
+    results.push(...batchResults);
+  }
+
+  const totalDetected = results.reduce((s, r) => s + r.detected_tracks.length, 0);
+  const totalDangerous = results.reduce((s, r) => s + r.dangerous_matches.length, 0);
+  const videosWithMatches = results.filter((r) => r.dangerous_matches.length > 0).length;
+
+  return { results, totalVideos: videos.length, totalDetected, totalDangerous, videosWithMatches };
+}
+
+module.exports = { processJob, resolveYouTubeUrl, fingerprintDangerSong, debugMatch, resolveChannelUrl, ytMetaScan };
