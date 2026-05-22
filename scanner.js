@@ -85,11 +85,11 @@ function parseDuration(iso) {
   return (parseInt(m[1] || 0) * 3600) + (parseInt(m[2] || 0) * 60) + parseInt(m[3] || 0);
 }
 
-// Load all approved danger songs from Supabase (no fingerprint required — AudD matches by title/artist)
+// Load all approved danger songs from Supabase
 async function loadDangerSongs() {
   const { data, error } = await supabase
     .from("danger_songs")
-    .select("id, title, artist, claimant")
+    .select("id, title, artist, claimant, match_type")
     .eq("approved", true);
 
   if (error) throw new Error(`Failed to load danger songs: ${error.message}`);
@@ -107,31 +107,39 @@ function normalize(str) {
     .trim();
 }
 
-// Check if an AudD recognition result matches any danger song by title + artist
+// Check if an AudD recognition result matches any danger entry (song, artist, or label)
 function matchesDangerSong(recognition, dangerSongs) {
-  if (!recognition?.title) return null;
-  const recTitle = normalize(recognition.title);
-  const recArtist = normalize(recognition.artist);
+  const recTitle = normalize(recognition?.title);
+  const recArtist = normalize(recognition?.artist);
+  const recLabel = normalize(recognition?.label);
 
   for (const song of dangerSongs) {
-    const songTitle = normalize(song.title);
-    const titleMatch =
-      recTitle === songTitle ||
-      recTitle.includes(songTitle) ||
-      songTitle.includes(recTitle);
-    if (!titleMatch) continue;
+    const matchType = song.match_type || "song";
 
-    // When both sides have artist info, require artist match too
-    const songArtist = normalize(song.artist);
-    if (songArtist && recArtist) {
-      const artistMatch =
-        recArtist === songArtist ||
-        recArtist.includes(songArtist) ||
-        songArtist.includes(recArtist);
-      if (!artistMatch) continue;
+    if (matchType === "song") {
+      if (!recTitle) continue;
+      const songTitle = normalize(song.title);
+      const titleMatch = recTitle === songTitle || recTitle.includes(songTitle) || songTitle.includes(recTitle);
+      if (!titleMatch) continue;
+      const songArtist = normalize(song.artist);
+      if (songArtist && recArtist) {
+        const artistMatch = recArtist === songArtist || recArtist.includes(songArtist) || songArtist.includes(recArtist);
+        if (!artistMatch) continue;
+      }
+      return song;
     }
 
-    return song;
+    if (matchType === "artist") {
+      if (!recArtist || !song.artist) continue;
+      const songArtist = normalize(song.artist);
+      if (recArtist === songArtist || recArtist.includes(songArtist) || songArtist.includes(recArtist)) return song;
+    }
+
+    if (matchType === "label") {
+      if (!recLabel || !song.title) continue;
+      const labelName = normalize(song.title);
+      if (recLabel === labelName || recLabel.includes(labelName) || labelName.includes(recLabel)) return song;
+    }
   }
   return null;
 }
@@ -217,6 +225,7 @@ async function processVideo(video, dangerSongs, jobId, onBatchComplete, attempt 
                 song_title: dangerSong.title,
                 song_artist: dangerSong.artist,
                 claimant: dangerSong.claimant,
+                match_type: dangerSong.match_type || "song",
                 detected_at_sec: start,
                 audd_timecode: recognition.timecode || null,
                 score: 100,
