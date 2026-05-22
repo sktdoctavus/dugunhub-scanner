@@ -103,13 +103,15 @@ app.post("/channel-videos", auth, async (req, res) => {
       },
     });
 
-    const videos = detailsRes.data.items.map((v) => ({
-      id: v.id,
-      title: v.snippet.title,
-      durationSec: parseDurationISO(v.contentDetails.duration),
-      channelTitle: v.snippet.channelTitle || channelTitle,
-      channelId: v.snippet.channelId || channelId,
-    }));
+    const videos = detailsRes.data.items
+      .map((v) => ({
+        id: v.id,
+        title: v.snippet.title,
+        durationSec: parseDurationISO(v.contentDetails.duration),
+        channelTitle: v.snippet.channelTitle || channelTitle,
+        channelId: v.snippet.channelId || channelId,
+      }))
+      .filter((v) => v.durationSec > 60); // exclude Shorts (≤ 60s)
 
     res.json({
       videos,
