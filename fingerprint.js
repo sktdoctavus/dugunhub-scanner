@@ -39,11 +39,14 @@ function resolveStreamUrl(videoUrl) {
   return result.stdout.trim().split("\n")[0];
 }
 
-// Download one audio segment from an already-resolved CDN stream URL.
+// Download one audio segment (or the full stream) from an already-resolved CDN stream URL.
+// Pass durationSec=null to download the entire file from startSec to end.
 async function downloadSegment(streamUrl, startSec, durationSec, tmpDir) {
-  const flacPath = path.join(tmpDir, `seg_${startSec}.mp3`);
+  const label = durationSec == null ? "full" : String(durationSec) + "s";
+  const flacPath = path.join(tmpDir, `seg_${startSec}_${label}.mp3`);
 
-  const ffArgs = ["-ss", String(startSec), "-t", String(durationSec)];
+  const ffArgs = ["-ss", String(startSec)];
+  if (durationSec != null) ffArgs.push("-t", String(durationSec));
   if (process.env.YTDLP_PROXY) ffArgs.push("-http_proxy", process.env.YTDLP_PROXY);
   ffArgs.push(
     "-i", streamUrl,
@@ -54,14 +57,17 @@ async function downloadSegment(streamUrl, startSec, durationSec, tmpDir) {
     "-y", flacPath,
   );
 
+  // Full-file downloads can take much longer — allow 30 minutes
+  const timeoutMs = durationSec == null ? 1800000 : 120000;
+
   await new Promise((resolve, reject) => {
-    execFile("ffmpeg", ffArgs, { timeout: 120000 }, (err, stdout, stderr) => {
+    execFile("ffmpeg", ffArgs, { timeout: timeoutMs }, (err, stdout, stderr) => {
       if (err) {
         console.error(`[ffmpeg] @${startSec}s failed: ${(stderr || err.message).slice(0, 400)}`);
         reject(new Error(stderr || err.message));
       } else {
         const size = fs.existsSync(flacPath) ? fs.statSync(flacPath).size : 0;
-        console.log(`[ffmpeg] @${startSec}s → mp3 (${size} bytes)`);
+        console.log(`[ffmpeg] @${startSec}s (${label}) → mp3 (${size} bytes)`);
         if (size === 0) reject(new Error("ffmpeg produced empty MP3"));
         else resolve();
       }

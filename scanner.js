@@ -591,11 +591,12 @@ async function fingerprintDangerSongFromYouTube(songId) {
   await setNote(`resolving stream: ${videoUrl}`);
 
   const streamUrl = resolveStreamUrl(videoUrl);
-  await setNote("downloading 120s segment");
+  await setNote("downloading full audio");
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "dh-yt-fp-"));
   try {
-    const audioPath = await downloadSegment(streamUrl, 0, 120, tmpDir);
+    // null duration = download the whole song so the fingerprint covers every second
+    const audioPath = await downloadSegment(streamUrl, 0, null, tmpDir);
     await setNote("running fpcalc");
 
     const { fingerprint: rawFp, duration } = getFingerprintFromFile(audioPath);
