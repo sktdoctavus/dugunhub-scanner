@@ -1,5 +1,5 @@
 const express = require("express");
-const { processJob, resolveYouTubeUrl, fingerprintDangerSong, debugMatch, resolveChannelUrl, ytMetaScan } = require("./scanner");
+const { processJob, resolveYouTubeUrl, fingerprintDangerSong, debugMatch, resolveChannelUrl, ytMetaScan, monitorUserChannel } = require("./scanner");
 const axios = require("axios");
 const { createClient } = require("@supabase/supabase-js");
 
@@ -141,6 +141,14 @@ app.post("/yt-meta-scan", auth, async (req, res) => {
   } catch (e) {
     res.status(400).json({ error: e.message });
   }
+});
+
+// Monitor a user's YouTube channel for new dangerous songs — fire-and-forget
+app.post("/channel-monitor", auth, async (req, res) => {
+  const { userId } = req.body;
+  if (!userId) return res.status(400).json({ error: "userId required" });
+  res.json({ status: "accepted", userId });
+  monitorUserChannel(userId).catch((e) => console.error(`Channel monitor ${userId} failed:`, e.message));
 });
 
 // Start a scan job — job must already exist in Supabase scan_jobs table
