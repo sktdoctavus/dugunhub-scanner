@@ -857,6 +857,7 @@ async function fetchPlaylistVideosSince(playlistId, sinceDate) {
 // only uncached ones. Updates channel_scan_progress in real time so the UI
 // can show per-video status as the scan runs.
 async function monitorUserChannel(userId) {
+  console.log(`[monitor] starting for user ${userId}`);
   const { data: profile, error: profileErr } = await supabase
     .from("profiles")
     .select("youtube, channel_last_scanned_at")
@@ -866,15 +867,20 @@ async function monitorUserChannel(userId) {
   if (profileErr || !profile) throw new Error(`Profile not found: ${profileErr?.message}`);
   if (!profile.youtube) throw new Error("No YouTube channel URL configured for this user");
 
+  console.log(`[monitor] channel URL: ${profile.youtube}`);
   const scanId = new Date().toISOString();
   await supabase.from("profiles").update({ channel_scan_started_at: scanId }).eq("id", userId);
 
   try {
-  const { uploadsPlaylistId } = await resolveChannelUrl(profile.youtube);
+  console.log(`[monitor] resolving channel URL...`);
+  const { uploadsPlaylistId, channelTitle } = await resolveChannelUrl(profile.youtube);
+  console.log(`[monitor] resolved: ${channelTitle} → playlist ${uploadsPlaylistId}`);
 
   // Always fetch all videos so the full list appears in the progress UI.
   // sinceDate=null means no cutoff — get every upload.
+  console.log(`[monitor] fetching all videos...`);
   const allVideos = await fetchPlaylistVideosSince(uploadsPlaylistId, null);
+  console.log(`[monitor] fetched ${allVideos.length} videos`);
 
   if (allVideos.length === 0) {
     await supabase.from("profiles").update({ channel_last_scanned_at: new Date().toISOString() }).eq("id", userId);
@@ -995,10 +1001,12 @@ async function monitorUserChannel(userId) {
     }
   }
 
-    await supabase.from("profiles").update({ channel_last_scanned_at: new Date().toISOString() }).eq("id", userId);
+    await supabase.from("profiles").update({ channel_last_scanned_at: new Date().toISOString(), channel_scan_started_at: null }).eq("id", userId);
+    console.log(`[monitor] done for ${userId}: scannedVideos=${scannedVideos} newAlerts=${newAlerts}`);
     return { scannedVideos, newAlerts };
   } catch (e) {
     // Clear the in-progress flag so the UI doesn't stay stuck
+    console.error(`[monitor] failed for ${userId}:`, e.message);
     await supabase.from("profiles").update({ channel_scan_started_at: null }).eq("id", userId);
     throw e;
   }
