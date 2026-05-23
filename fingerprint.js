@@ -29,16 +29,23 @@ function resolveStreamUrl(videoUrl) {
     "--extractor-args", "youtube:player_client=mweb,ios,tv_embedded,android",
   ];
 
-  // Optional YouTube cookies — set YTDLP_COOKIES_B64 in Railway to the base64-encoded
-  // contents of a Netscape-format cookies.txt exported from your browser.
-  if (process.env.YTDLP_COOKIES_B64) {
+  // Optional YouTube cookies — set YTDLP_COOKIES in Railway to the raw Netscape-format
+  // cookies.txt content exported from your browser (paste as-is, no base64 needed).
+  const rawCookies = process.env.YTDLP_COOKIES || process.env.YTDLP_COOKIES_B64;
+  if (rawCookies) {
     const cookiePath = path.join(os.tmpdir(), "yt_cookies.txt");
     try {
-      fs.writeFileSync(cookiePath, Buffer.from(process.env.YTDLP_COOKIES_B64, "base64").toString("utf8"));
+      // Accept either raw Netscape format or legacy base64-encoded format
+      const content = rawCookies.trimStart().startsWith("#")
+        ? rawCookies
+        : Buffer.from(rawCookies, "base64").toString("utf8");
+      fs.writeFileSync(cookiePath, content);
       ytArgs.push("--cookies", cookiePath);
+      console.log("[yt-dlp] using cookies file");
     } catch (_) { /* ignore */ }
   }
 
+  // Note: YTDLP_PROXY returning 402 means the proxy service has no credits — remove it.
   if (process.env.YTDLP_PROXY) ytArgs.push("--proxy", process.env.YTDLP_PROXY);
   ytArgs.push(videoUrl);
 

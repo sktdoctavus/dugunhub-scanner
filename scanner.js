@@ -105,10 +105,19 @@ async function fetchChannelUploadsPlaylistId({ forHandle, id, forUsername }) {
   const item = res.data.items?.[0];
   if (!item) throw new Error("Channel not found");
   return {
-    uploadsPlaylistId: item.contentDetails.relatedPlaylists.uploads,
-    channelTitle: item.snippet.title,
+    uploadsPlaylistId: item.contentDetails?.relatedPlaylists?.uploads,
+    channelTitle: item.snippet?.title,
     channelId: item.id,
   };
+}
+
+// Try forHandle first, then fall back to forUsername for legacy custom URLs
+async function resolveHandle(name) {
+  try {
+    return await fetchChannelUploadsPlaylistId({ forHandle: name });
+  } catch {
+    return fetchChannelUploadsPlaylistId({ forUsername: name });
+  }
 }
 
 // Resolve any YouTube channel URL to { uploadsPlaylistId, channelTitle, channelId }
@@ -134,15 +143,18 @@ async function resolveChannelUrl(url) {
     return fetchChannelUploadsPlaylistId({ forHandle: handleMatch[1] });
   }
   // Bare handle: youtube.com/SmartVideoBE (no prefix, no @)
+  // Try forHandle first (new-style), fall back to forUsername (legacy custom URL)
   if (parts.length === 1 && parts[0]) {
-    return fetchChannelUploadsPlaylistId({ forHandle: parts[0] });
+    return resolveHandle(parts[0]);
   }
   throw new Error("Could not parse channel URL");
 }
 
 // ISO 8601 duration (PT1H30M15S) → seconds
 function parseDuration(iso) {
+  if (!iso) return 0;
   const m = iso.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
+  if (!m) return 0;
   return (parseInt(m[1] || 0) * 3600) + (parseInt(m[2] || 0) * 60) + parseInt(m[3] || 0);
 }
 
