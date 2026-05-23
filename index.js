@@ -46,21 +46,46 @@ app.post("/preview", auth, async (req, res) => {
   }
 });
 
-// Extract fingerprint for a danger_song — fire-and-forget, updates DB when done
+// Fingerprint queue — caps concurrent DB+yt-dlp+ffmpeg jobs at FP_CONCURRENCY
+// regardless of how many /fingerprint-song requests arrive at once.
+let fpRunning = 0;
+const FP_CONCURRENCY = 3;
+const fpQueue = [];
+const fpQueued = new Set(); // deduplicate: ignore re-queued songs already waiting
+
+function processFpQueue() {
+  while (fpRunning < FP_CONCURRENCY && fpQueue.length > 0) {
+    const songId = fpQueue.shift();
+    fpQueued.delete(songId);
+    fpRunning++;
+    console.log(`[fp-queue] starting ${songId} (running=${fpRunning} queued=${fpQueue.length})`);
+    fingerprintDangerSong(songId)
+      .catch((e) => {
+        console.error(`Fingerprint job for ${songId} failed:`, e.message);
+        supabase.from("danger_songs")
+          .update({ notes: `Fingerprint error: ${e.message}` })
+          .eq("id", songId)
+          .then(() => {});
+      })
+      .finally(() => {
+        fpRunning--;
+        processFpQueue();
+      });
+  }
+}
+
+// Extract fingerprint for a danger_song — queued, updates DB when done
 app.post("/fingerprint-song", auth, async (req, res) => {
   const { songId } = req.body;
   if (!songId) return res.status(400).json({ error: "songId required" });
 
-  res.json({ status: "accepted", songId });
+  res.json({ status: "accepted", songId, queued: fpQueue.length, running: fpRunning });
 
-  fingerprintDangerSong(songId).catch((e) => {
-    console.error(`Fingerprint job for ${songId} failed:`, e.message);
-    // Mark fingerprint as failed via a sentinel value so admin knows
-    supabase.from("danger_songs")
-      .update({ notes: `Fingerprint error: ${e.message}` })
-      .eq("id", songId)
-      .then(() => {});
-  });
+  if (!fpQueued.has(songId)) {
+    fpQueue.push(songId);
+    fpQueued.add(songId);
+    processFpQueue();
+  }
 });
 
 // Debug: compare a YouTube URL against all danger songs synchronously, returns raw scores
