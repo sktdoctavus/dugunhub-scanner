@@ -25,8 +25,20 @@ function resolveStreamUrl(videoUrl) {
     "-g",
     "--no-playlist",
     "--format", "bestaudio/best",
-    "--extractor-args", "youtube:player_client=tv_embedded,web_embedded,android_vr,android",
+    // mweb + ios don't require PO tokens on most datacenter IPs; fall back to others
+    "--extractor-args", "youtube:player_client=mweb,ios,tv_embedded,android",
   ];
+
+  // Optional YouTube cookies — set YTDLP_COOKIES_B64 in Railway to the base64-encoded
+  // contents of a Netscape-format cookies.txt exported from your browser.
+  if (process.env.YTDLP_COOKIES_B64) {
+    const cookiePath = path.join(os.tmpdir(), "yt_cookies.txt");
+    try {
+      fs.writeFileSync(cookiePath, Buffer.from(process.env.YTDLP_COOKIES_B64, "base64").toString("utf8"));
+      ytArgs.push("--cookies", cookiePath);
+    } catch (_) { /* ignore */ }
+  }
+
   if (process.env.YTDLP_PROXY) ytArgs.push("--proxy", process.env.YTDLP_PROXY);
   ytArgs.push(videoUrl);
 

@@ -24,7 +24,7 @@ const SAMPLE_DURATION_SEC = 15;
 // How many segments to download + recognize simultaneously per video
 const SCAN_CONCURRENCY = 8;
 
-// Fetch all video IDs + durations from a YouTube playlist or single video URL
+// Fetch all video IDs + durations from a YouTube video, playlist, or channel URL
 async function resolveYouTubeUrl(url) {
   const videoMatch = url.match(/(?:v=|youtu\.be\/|\/live\/)([A-Za-z0-9_-]{11})/);
   const playlistMatch = url.match(/[?&]list=([A-Za-z0-9_-]+)/);
@@ -38,7 +38,16 @@ async function resolveYouTubeUrl(url) {
   } else if (videoMatch) {
     return await fetchVideoDetails([videoMatch[1]]);
   }
-  throw new Error("Invalid YouTube URL");
+
+  // Try to resolve as a channel URL (/@Handle, /channel/UCxxx, /c/Name, /user/Name)
+  try {
+    const { uploadsPlaylistId } = await resolveChannelUrl(url);
+    return await fetchPlaylistVideos(uploadsPlaylistId);
+  } catch {
+    // not a channel URL either
+  }
+
+  throw new Error("Invalid YouTube URL — paste a video link, playlist link, or channel URL (e.g. youtube.com/@ChannelName)");
 }
 
 async function fetchPlaylistVideos(playlistId) {
@@ -77,6 +86,8 @@ async function fetchVideoDetails(videoIds) {
     title: v.snippet.title,
     durationSec: parseDuration(v.contentDetails.duration),
     url: `https://www.youtube.com/watch?v=${v.id}`,
+    thumbnailUrl: v.snippet.thumbnails?.medium?.url || v.snippet.thumbnails?.default?.url || null,
+    publishedAt: v.snippet.publishedAt || null,
     channelTitle: v.snippet.channelTitle || null,
     channelId: v.snippet.channelId || null,
   }));
@@ -786,4 +797,189 @@ async function ytMetaScan(youtubeUrl) {
   return { results, totalVideos: videos.length, totalDetected, totalDangerous, videosWithMatches };
 }
 
-module.exports = { processJob, resolveYouTubeUrl, fingerprintDangerSong, debugMatch, resolveChannelUrl, ytMetaScan };
+// Fetch videos from an uploads playlist published after sinceDate (ISO string or null for all).
+// Playlist items are newest-first, so we stop paging once we hit the cutoff.
+async function fetchPlaylistVideosSince(playlistId, sinceDate) {
+  const cutoff = sinceDate ? new Date(sinceDate) : null;
+  const videoIds = [];
+  let pageToken = "";
+
+  do {
+    const res = await axios.get("https://www.googleapis.com/youtube/v3/playlistItems", {
+      params: {
+        part: "snippet,contentDetails",
+        playlistId,
+        maxResults: 50,
+        pageToken: pageToken || undefined,
+        key: YOUTUBE_API_KEY,
+      },
+    });
+
+    let reachedCutoff = false;
+    for (const item of res.data.items) {
+      if (item.snippet.title === "Private video" || item.snippet.title === "Deleted video") continue;
+      const publishedAt = new Date(item.snippet.publishedAt);
+      if (cutoff && publishedAt <= cutoff) { reachedCutoff = true; break; }
+      videoIds.push(item.contentDetails.videoId);
+    }
+
+    pageToken = reachedCutoff ? "" : (res.data.nextPageToken || "");
+  } while (pageToken);
+
+  if (videoIds.length === 0) return [];
+
+  const results = [];
+  for (let i = 0; i < videoIds.length; i += 50) {
+    const details = await fetchVideoDetails(videoIds.slice(i, i + 50));
+    results.push(...details);
+  }
+  return results;
+}
+
+// Scan a user's YouTube channel for dangerous songs.
+// Fetches ALL channel videos upfront for the progress display, then processes
+// only uncached ones. Updates channel_scan_progress in real time so the UI
+// can show per-video status as the scan runs.
+async function monitorUserChannel(userId) {
+  const { data: profile, error: profileErr } = await supabase
+    .from("profiles")
+    .select("youtube, channel_last_scanned_at")
+    .eq("id", userId)
+    .single();
+
+  if (profileErr || !profile) throw new Error(`Profile not found: ${profileErr?.message}`);
+  if (!profile.youtube) throw new Error("No YouTube channel URL configured for this user");
+
+  const scanId = new Date().toISOString();
+  await supabase.from("profiles").update({ channel_scan_started_at: scanId }).eq("id", userId);
+
+  const { uploadsPlaylistId } = await resolveChannelUrl(profile.youtube);
+
+  // Always fetch all videos so the full list appears in the progress UI.
+  // sinceDate=null means no cutoff — get every upload.
+  const allVideos = await fetchPlaylistVideosSince(uploadsPlaylistId, null);
+
+  if (allVideos.length === 0) {
+    await supabase.from("profiles").update({ channel_last_scanned_at: new Date().toISOString() }).eq("id", userId);
+    return { scannedVideos: 0, newAlerts: 0 };
+  }
+
+  // Seed the progress table so the frontend sees all videos immediately
+  const progressRows = allVideos.map((v) => ({
+    user_id: userId,
+    scan_id: scanId,
+    video_id: v.id,
+    video_title: v.title,
+    video_url: v.url,
+    video_thumbnail: v.thumbnailUrl || null,
+    duration_sec: v.durationSec || null,
+    published_at: v.publishedAt || null,
+    status: "pending",
+    alert_count: 0,
+  }));
+
+  // Insert in batches of 100 to stay within request size limits
+  for (let i = 0; i < progressRows.length; i += 100) {
+    await supabase.from("channel_scan_progress")
+      .upsert(progressRows.slice(i, i + 100), { onConflict: "user_id,scan_id,video_id" });
+  }
+
+  // Find already-cached videos and mark them done right away
+  const { data: cached } = await supabase
+    .from("video_music_cache")
+    .select("video_id")
+    .eq("user_id", userId)
+    .in("video_id", allVideos.map((v) => v.id));
+
+  const cachedIds = new Set((cached || []).map((c) => c.video_id));
+
+  if (cachedIds.size > 0) {
+    const cachedArr = [...cachedIds];
+    for (let i = 0; i < cachedArr.length; i += 100) {
+      await supabase.from("channel_scan_progress")
+        .update({ status: "done", processed_at: new Date().toISOString() })
+        .eq("user_id", userId)
+        .eq("scan_id", scanId)
+        .in("video_id", cachedArr.slice(i, i + 100));
+    }
+  }
+
+  const newVideos = allVideos.filter((v) => !cachedIds.has(v.id));
+  const dangerSongs = await loadDangerSongs();
+  const CONCURRENCY = 3; // lower concurrency so yt-dlp doesn't saturate Railway CPU
+  let scannedVideos = 0;
+  let newAlerts = 0;
+
+  for (let i = 0; i < newVideos.length; i += CONCURRENCY) {
+    const batch = newVideos.slice(i, i + CONCURRENCY);
+    // Process sequentially within each batch (extractYtMusicTracks uses spawnSync)
+    for (const video of batch) {
+      // Mark as currently scanning
+      await supabase.from("channel_scan_progress")
+        .update({ status: "scanning" })
+        .eq("user_id", userId)
+        .eq("scan_id", scanId)
+        .eq("video_id", video.id);
+
+      const detectedTracks = extractYtMusicTracks(video.id);
+
+      await supabase.from("video_music_cache").upsert({
+        user_id: userId,
+        video_id: video.id,
+        video_title: video.title,
+        video_url: video.url,
+        duration_sec: video.durationSec,
+        detected_tracks: detectedTracks,
+        scanned_at: new Date().toISOString(),
+      }, { onConflict: "user_id,video_id" });
+
+      scannedVideos++;
+      let alertCount = 0;
+
+      for (const track of detectedTracks) {
+        const hit = matchesDangerSong(track, dangerSongs);
+        if (!hit) continue;
+
+        const { data: existing } = await supabase
+          .from("channel_alerts")
+          .select("id")
+          .eq("user_id", userId)
+          .eq("video_id", video.id)
+          .eq("danger_song_id", hit.id)
+          .maybeSingle();
+
+        if (!existing) {
+          await supabase.from("channel_alerts").insert({
+            user_id: userId,
+            video_id: video.id,
+            video_title: video.title,
+            video_url: video.url,
+            danger_song_id: hit.id,
+            danger_song_title: hit.title,
+            danger_song_artist: hit.artist,
+            claimant: hit.claimant,
+            match_type: hit.match_type || "song",
+          });
+          newAlerts++;
+          alertCount++;
+        }
+      }
+
+      // Mark final status
+      await supabase.from("channel_scan_progress")
+        .update({
+          status: alertCount > 0 ? "alert" : "done",
+          alert_count: alertCount,
+          processed_at: new Date().toISOString(),
+        })
+        .eq("user_id", userId)
+        .eq("scan_id", scanId)
+        .eq("video_id", video.id);
+    }
+  }
+
+  await supabase.from("profiles").update({ channel_last_scanned_at: new Date().toISOString() }).eq("id", userId);
+  return { scannedVideos, newAlerts };
+}
+
+module.exports = { processJob, resolveYouTubeUrl, fingerprintDangerSong, debugMatch, resolveChannelUrl, ytMetaScan, monitorUserChannel };
