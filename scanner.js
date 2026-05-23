@@ -133,6 +133,10 @@ async function resolveChannelUrl(url) {
   if (handleMatch) {
     return fetchChannelUploadsPlaylistId({ forHandle: handleMatch[1] });
   }
+  // Bare handle: youtube.com/SmartVideoBE (no prefix, no @)
+  if (parts.length === 1 && parts[0]) {
+    return fetchChannelUploadsPlaylistId({ forHandle: parts[0] });
+  }
   throw new Error("Could not parse channel URL");
 }
 
