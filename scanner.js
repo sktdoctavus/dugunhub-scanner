@@ -857,6 +857,7 @@ async function monitorUserChannel(userId) {
   const scanId = new Date().toISOString();
   await supabase.from("profiles").update({ channel_scan_started_at: scanId }).eq("id", userId);
 
+  try {
   const { uploadsPlaylistId } = await resolveChannelUrl(profile.youtube);
 
   // Always fetch all videos so the full list appears in the progress UI.
@@ -982,8 +983,13 @@ async function monitorUserChannel(userId) {
     }
   }
 
-  await supabase.from("profiles").update({ channel_last_scanned_at: new Date().toISOString() }).eq("id", userId);
-  return { scannedVideos, newAlerts };
+    await supabase.from("profiles").update({ channel_last_scanned_at: new Date().toISOString() }).eq("id", userId);
+    return { scannedVideos, newAlerts };
+  } catch (e) {
+    // Clear the in-progress flag so the UI doesn't stay stuck
+    await supabase.from("profiles").update({ channel_scan_started_at: null }).eq("id", userId);
+    throw e;
+  }
 }
 
 module.exports = { processJob, resolveYouTubeUrl, fingerprintDangerSong, debugMatch, resolveChannelUrl, ytMetaScan, monitorUserChannel };
