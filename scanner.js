@@ -969,6 +969,49 @@ async function fetchPlaylistVideosSince(playlistId, sinceDate) {
   return results;
 }
 
+// Fingerprint a single video against the danger_songs database.
+// Checks 3×15s segments from the first 90s of the video.
+// Returns [{song: dangerSongRow, atSec: number}] for each distinct match.
+async function monitorVideoFingerprint(video, dangerSongsWithFp) {
+  if (!dangerSongsWithFp || dangerSongsWithFp.length === 0) return [];
+  let streamUrl;
+  try {
+    streamUrl = resolveStreamUrl(video.url);
+  } catch (e) {
+    console.error(`[monitor-fp] ${video.id}: stream resolve failed: ${e.message.slice(0, 200)}`);
+    return [];
+  }
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "dh-mfp-"));
+  const maxSec = video.durationSec || 999;
+  const segments = [0, 30, 60].filter(s => s < maxSec);
+  const matchedIds = new Set();
+  const matches = [];
+
+  try {
+    for (const startSec of segments) {
+      try {
+        const audioPath = await downloadSegment(streamUrl, startSec, 15, tmpDir);
+        const { fingerprint: clipFp } = getFingerprintFromFile(audioPath);
+        try { fs.unlinkSync(audioPath); } catch {}
+        const hit = matchFingerprintToDangerSongs(clipFp, dangerSongsWithFp);
+        if (hit && !matchedIds.has(hit.song.id)) {
+          matchedIds.add(hit.song.id);
+          matches.push({ song: hit.song, atSec: startSec });
+          console.log(`[monitor-fp] ${video.id}: MATCH "${hit.song.title}" at ${startSec}s (BER=${hit.ber.toFixed(3)})`);
+        }
+      } catch (e) {
+        console.error(`[monitor-fp] ${video.id}@${startSec}s: ${e.message.slice(0, 150)}`);
+      }
+    }
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+  }
+
+  console.log(`[monitor-fp] ${video.id}: ${matches.length} fingerprint match(es)`);
+  return matches;
+}
+
 // Scan a user's YouTube channel for dangerous songs.
 // Fetches ALL channel videos upfront for the progress display, then processes
 // only uncached ones. Updates channel_scan_progress in real time so the UI
@@ -1046,24 +1089,28 @@ async function monitorUserChannel(userId) {
 
   const newVideos = allVideos.filter((v) => !cachedIds.has(v.id));
   const dangerSongs = await loadDangerSongs();
-  const CONCURRENCY = 3; // lower concurrency so yt-dlp doesn't saturate Railway CPU
+  const dangerSongsWithFp = await loadDangerSongsWithFingerprints();
+  console.log(`[monitor] ${dangerSongs.length} danger songs, ${dangerSongsWithFp.length} with fingerprints, ${newVideos.length} videos to scan`);
+
+  // CONCURRENCY=3: process 3 videos in parallel without saturating Railway CPU
+  const CONCURRENCY = 3;
   let scannedVideos = 0;
   let newAlerts = 0;
 
   for (let i = 0; i < newVideos.length; i += CONCURRENCY) {
     const batch = newVideos.slice(i, i + CONCURRENCY);
-    for (const video of batch) {
-      // Mark as currently scanning
+    await Promise.all(batch.map(async (video) => {
       await supabase.from("channel_scan_progress")
         .update({ status: "scanning" })
-        .eq("user_id", userId)
-        .eq("scan_id", scanId)
-        .eq("video_id", video.id);
+        .eq("user_id", userId).eq("scan_id", scanId).eq("video_id", video.id);
 
-      const detectedTracks = await extractYtMusicTracks(video.id);
+      // Primary: Content ID metadata (free, fast — but YouTube strips data for datacenter IPs)
+      const metaTracks = await extractYtMusicTracks(video.id);
 
-      // Throttle to stay below YouTube's per-IP rate limit for watch page fetches
-      await new Promise((r) => setTimeout(r, 8000));
+      // Fallback: local acoustic fingerprinting against our danger_songs database.
+      // Checks 3×15s segments from the first 90 seconds of the video.
+      // Uses yt-dlp mweb/ios clients for stream resolution which works on Railway.
+      const fpMatches = await monitorVideoFingerprint(video, dangerSongsWithFp);
 
       await supabase.from("video_music_cache").upsert({
         user_id: userId,
@@ -1071,53 +1118,55 @@ async function monitorUserChannel(userId) {
         video_title: video.title,
         video_url: video.url,
         duration_sec: video.durationSec,
-        detected_tracks: detectedTracks,
+        detected_tracks: metaTracks,
         scanned_at: new Date().toISOString(),
       }, { onConflict: "user_id,video_id" });
 
       scannedVideos++;
       let alertCount = 0;
+      const alertedSongIds = new Set();
 
-      for (const track of detectedTracks) {
+      // Content ID tracks → text-match against danger songs
+      for (const track of metaTracks) {
         const hit = matchesDangerSong(track, dangerSongs);
-        if (!hit) continue;
-
-        const { data: existing } = await supabase
-          .from("channel_alerts")
-          .select("id")
-          .eq("user_id", userId)
-          .eq("video_id", video.id)
-          .eq("danger_song_id", hit.id)
-          .maybeSingle();
-
+        if (!hit || alertedSongIds.has(hit.id)) continue;
+        alertedSongIds.add(hit.id);
+        const { data: existing } = await supabase.from("channel_alerts")
+          .select("id").eq("user_id", userId).eq("video_id", video.id).eq("danger_song_id", hit.id).maybeSingle();
         if (!existing) {
           await supabase.from("channel_alerts").insert({
-            user_id: userId,
-            video_id: video.id,
-            video_title: video.title,
-            video_url: video.url,
-            danger_song_id: hit.id,
-            danger_song_title: hit.title,
-            danger_song_artist: hit.artist,
-            claimant: hit.claimant,
-            match_type: hit.match_type || "song",
+            user_id: userId, video_id: video.id, video_title: video.title, video_url: video.url,
+            danger_song_id: hit.id, danger_song_title: hit.title, danger_song_artist: hit.artist,
+            claimant: hit.claimant, match_type: hit.match_type || "song",
           });
-          newAlerts++;
-          alertCount++;
+          newAlerts++; alertCount++;
         }
       }
 
-      // Mark final status
+      // Fingerprint matches → already identified the exact danger song
+      for (const { song } of fpMatches) {
+        if (alertedSongIds.has(song.id)) continue;
+        alertedSongIds.add(song.id);
+        const { data: existing } = await supabase.from("channel_alerts")
+          .select("id").eq("user_id", userId).eq("video_id", video.id).eq("danger_song_id", song.id).maybeSingle();
+        if (!existing) {
+          await supabase.from("channel_alerts").insert({
+            user_id: userId, video_id: video.id, video_title: video.title, video_url: video.url,
+            danger_song_id: song.id, danger_song_title: song.title, danger_song_artist: song.artist,
+            claimant: song.claimant, match_type: song.match_type || "song",
+          });
+          newAlerts++; alertCount++;
+        }
+      }
+
       await supabase.from("channel_scan_progress")
         .update({
           status: alertCount > 0 ? "alert" : "done",
           alert_count: alertCount,
           processed_at: new Date().toISOString(),
         })
-        .eq("user_id", userId)
-        .eq("scan_id", scanId)
-        .eq("video_id", video.id);
-    }
+        .eq("user_id", userId).eq("scan_id", scanId).eq("video_id", video.id);
+    }));
   }
 
     await supabase.from("profiles").update({ channel_last_scanned_at: new Date().toISOString(), channel_scan_started_at: null }).eq("id", userId);
