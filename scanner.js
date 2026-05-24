@@ -783,10 +783,21 @@ function parseMusicSectionsToTracks(musicSections) {
   return tracks;
 }
 
+// Recursively collect every distinct key name in an object tree that contains a substring.
+function findKeysContaining(obj, substr, depth = 0, found = new Set()) {
+  if (!obj || depth > 20 || typeof obj !== "object") return found;
+  if (!Array.isArray(obj)) {
+    for (const key of Object.keys(obj)) {
+      if (key.toLowerCase().includes(substr.toLowerCase())) found.add(key);
+      findKeysContaining(obj[key], substr, depth + 1, found);
+    }
+  } else {
+    for (const child of obj) findKeysContaining(child, substr, depth + 1, found);
+  }
+  return found;
+}
+
 // Extract "Music in this video" tracks via YouTube's InnerTube /next API.
-// This is the same JSON endpoint the YouTube frontend uses to load the description
-// panel — it returns the full structured description including music sections,
-// without requiring HTML parsing or PO tokens.
 // Returns [{title, artist, album}].
 async function extractYtMusicTracks(videoId, attempt = 1) {
   try {
@@ -817,16 +828,44 @@ async function extractYtMusicTracks(videoId, attempt = 1) {
 
     const data = res.data;
     const panels = data?.engagementPanels || [];
-    const musicSections = findMusicSections(data);
 
-    // Log the panel structure once per process start so we can diagnose if needed
-    if (attempt === 1 && videoId === (global._ytDiagVideoId || videoId)) {
-      global._ytDiagVideoId = null; // only log once
-      console.log(`[yt-next] ${videoId}: status=${res.status} panels=${panels.length} musicSections=${musicSections.length}`);
+    // Always log panel identifiers so we know what came back
+    const panelIds = panels.map(p =>
+      p?.engagementPanelSectionListRenderer?.panelIdentifier || "?"
+    ).join(", ");
+    console.log(`[yt-next] ${videoId}: panels=[${panelIds}]`);
+
+    // One-time deep diagnostic: show description panel items + all "music" keys
+    if (!global._ytDiagDone) {
+      global._ytDiagDone = true;
+
+      const descPanel = panels.find(p =>
+        (p?.engagementPanelSectionListRenderer?.panelIdentifier || "").includes("description")
+      );
+      if (descPanel) {
+        const content = descPanel.engagementPanelSectionListRenderer?.content || {};
+        console.log(`[yt-diag] desc-panel content keys: [${Object.keys(content).join(", ")}]`);
+        const items =
+          content?.structuredDescriptionContentRenderer?.items ||
+          content?.videoDescriptionMusicSectionRenderer?.items ||
+          [];
+        console.log(`[yt-diag] desc-panel items: ${items.length}`);
+        items.slice(0, 10).forEach((item, i) => {
+          console.log(`[yt-diag] item[${i}] keys: [${Object.keys(item || {}).join(", ")}]`);
+        });
+      } else {
+        console.log(`[yt-diag] no description panel found`);
+        console.log(`[yt-diag] response top-level keys: [${Object.keys(data || {}).join(", ")}]`);
+      }
+
+      // Search the entire response for any key containing "music"
+      const musicKeys = [...findKeysContaining(data, "music")];
+      console.log(`[yt-diag] all keys containing "music": [${musicKeys.join(", ")}]`);
     }
 
+    const musicSections = findMusicSections(data);
     const tracks = parseMusicSectionsToTracks(musicSections);
-    console.log(`[yt-next] ${videoId}: panels=${panels.length} sections=${musicSections.length} tracks=${tracks.length}`);
+    console.log(`[yt-next] ${videoId}: sections=${musicSections.length} tracks=${tracks.length}`);
     return tracks;
   } catch (e) {
     if (e.response?.status === 429 && attempt <= 3) {
