@@ -45,8 +45,10 @@ function resolveStreamUrl(videoUrl) {
     } catch (_) { /* ignore */ }
   }
 
-  // Note: YTDLP_PROXY returning 402 means the proxy service has no credits — remove it.
-  if (process.env.YTDLP_PROXY) ytArgs.push("--proxy", process.env.YTDLP_PROXY);
+  // Explicitly set proxy to disable any system HTTP_PROXY/HTTPS_PROXY env vars
+  // that Railway may inject — yt-dlp (Python urllib) picks these up automatically.
+  // If YTDLP_PROXY is set, use it; otherwise force no proxy with empty string.
+  ytArgs.push("--proxy", process.env.YTDLP_PROXY || "");
   ytArgs.push(videoUrl);
 
   const result = spawnSync("yt-dlp", ytArgs, { timeout: 60000, encoding: "utf8" });
