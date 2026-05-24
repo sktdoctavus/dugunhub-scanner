@@ -735,9 +735,11 @@ function extractYtMusicTracks(videoId) {
   const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
   const args = [
     "--skip-download", "--no-playlist", "-j",
-    // mweb fetches the full mobile YouTube page including engagement panels (Music in this video).
-    // Embedded/android clients return stripped responses without music metadata.
-    "--extractor-args", "youtube:player_client=mweb,ios",
+    // The "Music in this video" data lives in YouTube engagement panels inside ytInitialData.
+    // Only the web (desktop) client fetches the full YouTube watch page HTML that contains
+    // these panels. InnerTube API clients (android, ios, mweb, tv_embedded, web_embedded)
+    // return stripped JSON responses that never include engagement panel data.
+    "--extractor-args", "youtube:player_client=web",
   ];
   if (process.env.YTDLP_PROXY) args.push("--proxy", process.env.YTDLP_PROXY);
   args.push(videoUrl);
@@ -748,11 +750,17 @@ function extractYtMusicTracks(videoId) {
   delete env.http_proxy; delete env.https_proxy;
   delete env.ALL_PROXY;  delete env.all_proxy;
 
-  const result = spawnSync("yt-dlp", args, { timeout: 30000, encoding: "utf8", env });
+  // web client fetches a full HTML page — allow more time than API-based clients
+  const result = spawnSync("yt-dlp", args, { timeout: 60000, encoding: "utf8", env });
+
+  console.log(`[yt-meta] ${videoId}: exit=${result.status} stdout_len=${result.stdout?.length || 0} stderr_snippet=${result.stderr?.slice(0, 200)}`);
+
   if (result.status !== 0 || !result.stdout?.trim()) return [];
 
   let info;
   try { info = JSON.parse(result.stdout); } catch { return []; }
+
+  console.log(`[yt-meta] ${videoId}: has_music=${Array.isArray(info.music)} music_len=${info.music?.length || 0} top_track=${info.track || "-"} top_artist=${info.artist || "-"}`);
 
   const tracks = [];
 
@@ -771,6 +779,7 @@ function extractYtMusicTracks(videoId) {
     tracks.push({ title: info.track || null, artist: info.artist || null, album: info.album || null });
   }
 
+  console.log(`[yt-meta] ${videoId}: returning ${tracks.length} tracks`);
   return tracks;
 }
 
