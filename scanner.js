@@ -752,7 +752,7 @@ function findMusicSections(obj, depth = 0, results = []) {
 // Extract "Music in this video" tracks by fetching the YouTube watch page HTML and
 // parsing ytInitialData. No yt-dlp needed — works on any IP without PO tokens.
 // Returns [{title, artist, album}].
-async function extractYtMusicTracks(videoId) {
+async function extractYtMusicTracks(videoId, attempt = 1) {
   const url = `https://www.youtube.com/watch?v=${videoId}&hl=en`;
   try {
     const res = await axios.get(url, {
@@ -760,6 +760,7 @@ async function extractYtMusicTracks(videoId) {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Cookie": "SOCS=CAI",
       },
       timeout: 30000,
       decompress: true,
@@ -824,6 +825,13 @@ async function extractYtMusicTracks(videoId) {
     console.log(`[yt-html] ${videoId}: returning ${tracks.length} track(s)`);
     return tracks;
   } catch (e) {
+    if (e.response?.status === 429 && attempt <= 3) {
+      // YouTube rate limit — back off exponentially: 2min, 4min, 8min
+      const waitMs = Math.pow(2, attempt) * 60000;
+      console.log(`[yt-html] ${videoId}: 429 rate limit, waiting ${waitMs / 60000}min (attempt ${attempt}/3)`);
+      await new Promise((r) => setTimeout(r, waitMs));
+      return extractYtMusicTracks(videoId, attempt + 1);
+    }
     console.error(`[yt-html] ${videoId}: ${e.message.slice(0, 200)}`);
     return [];
   }
@@ -1007,6 +1015,9 @@ async function monitorUserChannel(userId) {
         .eq("video_id", video.id);
 
       const detectedTracks = await extractYtMusicTracks(video.id);
+
+      // Throttle to stay below YouTube's per-IP rate limit for watch page fetches
+      await new Promise((r) => setTimeout(r, 8000));
 
       await supabase.from("video_music_cache").upsert({
         user_id: userId,
