@@ -797,13 +797,19 @@ function extractYtMusicTracksViaYtDlp(videoId) {
     "--skip-download",
     "--no-playlist",
     "-q",
-    "--extractor-args", "youtube:player_client=mweb,ios,tv_embedded",
+    "--extractor-args", "youtube:player_client=mweb,ios,tv_embedded,android",
     `https://www.youtube.com/watch?v=${videoId}`,
   ], { timeout: 60000, encoding: "utf8", env });
 
-  if (result.status !== 0 || !result.stdout?.trim()) {
-    console.error(`[yt-dlp-json] ${videoId}: exit ${result.status} — ${(result.stderr || "").slice(0, 300)}`);
+  // Only bail when stdout is truly empty. Exit code 1 can mean "Signature solving
+  // failed" — a WARNING about streaming formats, not a metadata failure. yt-dlp
+  // may still output valid JSON with the music field despite non-zero exit.
+  if (!result.stdout?.trim()) {
+    console.error(`[yt-dlp-json] ${videoId}: no output (exit ${result.status}) — ${(result.stderr || "").slice(0, 300)}`);
     return null;
+  }
+  if (result.status !== 0) {
+    console.log(`[yt-dlp-json] ${videoId}: exit ${result.status} (non-zero but has output, parsing anyway)`);
   }
 
   let info;
@@ -1089,8 +1095,7 @@ async function monitorUserChannel(userId) {
 
   const newVideos = allVideos.filter((v) => !cachedIds.has(v.id));
   const dangerSongs = await loadDangerSongs();
-  const dangerSongsWithFp = await loadDangerSongsWithFingerprints();
-  console.log(`[monitor] ${dangerSongs.length} danger songs, ${dangerSongsWithFp.length} with fingerprints, ${newVideos.length} videos to scan`);
+  console.log(`[monitor] ${dangerSongs.length} danger songs, ${newVideos.length} videos to scan`);
 
   // CONCURRENCY=3: process 3 videos in parallel without saturating Railway CPU
   const CONCURRENCY = 3;
@@ -1104,13 +1109,7 @@ async function monitorUserChannel(userId) {
         .update({ status: "scanning" })
         .eq("user_id", userId).eq("scan_id", scanId).eq("video_id", video.id);
 
-      // Primary: Content ID metadata (free, fast — but YouTube strips data for datacenter IPs)
       const metaTracks = await extractYtMusicTracks(video.id);
-
-      // Fallback: local acoustic fingerprinting against our danger_songs database.
-      // Checks 3×15s segments from the first 90 seconds of the video.
-      // Uses yt-dlp mweb/ios clients for stream resolution which works on Railway.
-      const fpMatches = await monitorVideoFingerprint(video, dangerSongsWithFp);
 
       await supabase.from("video_music_cache").upsert({
         user_id: userId,
@@ -1138,22 +1137,6 @@ async function monitorUserChannel(userId) {
             user_id: userId, video_id: video.id, video_title: video.title, video_url: video.url,
             danger_song_id: hit.id, danger_song_title: hit.title, danger_song_artist: hit.artist,
             claimant: hit.claimant, match_type: hit.match_type || "song",
-          });
-          newAlerts++; alertCount++;
-        }
-      }
-
-      // Fingerprint matches → already identified the exact danger song
-      for (const { song } of fpMatches) {
-        if (alertedSongIds.has(song.id)) continue;
-        alertedSongIds.add(song.id);
-        const { data: existing } = await supabase.from("channel_alerts")
-          .select("id").eq("user_id", userId).eq("video_id", video.id).eq("danger_song_id", song.id).maybeSingle();
-        if (!existing) {
-          await supabase.from("channel_alerts").insert({
-            user_id: userId, video_id: video.id, video_title: video.title, video_url: video.url,
-            danger_song_id: song.id, danger_song_title: song.title, danger_song_artist: song.artist,
-            claimant: song.claimant, match_type: song.match_type || "song",
           });
           newAlerts++; alertCount++;
         }
