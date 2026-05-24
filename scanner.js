@@ -783,23 +783,65 @@ function parseMusicSectionsToTracks(musicSections) {
   return tracks;
 }
 
-// Recursively collect every distinct key name in an object tree that contains a substring.
-function findKeysContaining(obj, substr, depth = 0, found = new Set()) {
-  if (!obj || depth > 20 || typeof obj !== "object") return found;
-  if (!Array.isArray(obj)) {
-    for (const key of Object.keys(obj)) {
-      if (key.toLowerCase().includes(substr.toLowerCase())) found.add(key);
-      findKeysContaining(obj[key], substr, depth + 1, found);
-    }
-  } else {
-    for (const child of obj) findKeysContaining(child, substr, depth + 1, found);
+// Extract "Music in this video" via yt-dlp --dump-json (synchronous).
+// yt-dlp natively parses ytInitialData including the music section.
+// Returns [{title, artist, album}] on success, null if yt-dlp failed.
+function extractYtMusicTracksViaYtDlp(videoId) {
+  const env = { ...process.env };
+  delete env.HTTP_PROXY; delete env.HTTPS_PROXY;
+  delete env.http_proxy; delete env.https_proxy;
+  delete env.ALL_PROXY;  delete env.all_proxy;
+
+  const result = spawnSync("yt-dlp", [
+    "--dump-json",
+    "--skip-download",
+    "--no-playlist",
+    "-q",
+    "--extractor-args", "youtube:player_client=mweb,ios,tv_embedded",
+    `https://www.youtube.com/watch?v=${videoId}`,
+  ], { timeout: 60000, encoding: "utf8", env });
+
+  if (result.status !== 0 || !result.stdout?.trim()) {
+    console.error(`[yt-dlp-json] ${videoId}: exit ${result.status} — ${(result.stderr || "").slice(0, 300)}`);
+    return null;
   }
-  return found;
+
+  let info;
+  try { info = JSON.parse(result.stdout.trim().split("\n")[0]); }
+  catch (e) { console.error(`[yt-dlp-json] ${videoId}: JSON parse error`); return null; }
+
+  // One-time diagnostic to confirm music field structure
+  if (!global._ytDlpDiagDone) {
+    global._ytDlpDiagDone = true;
+    const musicKeys = Object.keys(info).filter(k => k.toLowerCase().includes("music") || k.toLowerCase().includes("song"));
+    console.log(`[yt-dlp-diag] music-related keys: [${musicKeys.join(", ")}]`);
+    if (info.music !== undefined) console.log(`[yt-dlp-diag] music sample: ${JSON.stringify(info.music).slice(0, 500)}`);
+  }
+
+  if (!Array.isArray(info.music) || info.music.length === 0) {
+    console.log(`[yt-dlp-json] ${videoId}: 0 music entries`);
+    return [];
+  }
+
+  const tracks = info.music.map(m => ({
+    title: m.title || m.song || null,
+    artist: m.artist || null,
+    album: m.album || null,
+  })).filter(t => t.title || t.artist);
+
+  console.log(`[yt-dlp-json] ${videoId}: ${tracks.length} music tracks`);
+  return tracks;
 }
 
-// Extract "Music in this video" tracks via YouTube's InnerTube /next API.
+// Extract "Music in this video" tracks. Tries yt-dlp first; falls back to
+// InnerTube /next API if yt-dlp fails (e.g. not installed or network block).
 // Returns [{title, artist, album}].
 async function extractYtMusicTracks(videoId, attempt = 1) {
+  // Primary path: yt-dlp parses ytInitialData which includes the music section
+  const ytDlpResult = extractYtMusicTracksViaYtDlp(videoId);
+  if (ytDlpResult !== null) return ytDlpResult;
+
+  // Fallback: InnerTube /next API
   try {
     const res = await axios.post(
       "https://www.youtube.com/youtubei/v1/next",
@@ -825,45 +867,7 @@ async function extractYtMusicTracks(videoId, attempt = 1) {
         timeout: 30000,
       }
     );
-
-    const data = res.data;
-    const panels = data?.engagementPanels || [];
-
-    // Always log panel identifiers so we know what came back
-    const panelIds = panels.map(p =>
-      p?.engagementPanelSectionListRenderer?.panelIdentifier || "?"
-    ).join(", ");
-    console.log(`[yt-next] ${videoId}: panels=[${panelIds}]`);
-
-    // One-time deep diagnostic: show description panel items + all "music" keys
-    if (!global._ytDiagDone) {
-      global._ytDiagDone = true;
-
-      const descPanel = panels.find(p =>
-        (p?.engagementPanelSectionListRenderer?.panelIdentifier || "").includes("description")
-      );
-      if (descPanel) {
-        const content = descPanel.engagementPanelSectionListRenderer?.content || {};
-        console.log(`[yt-diag] desc-panel content keys: [${Object.keys(content).join(", ")}]`);
-        const items =
-          content?.structuredDescriptionContentRenderer?.items ||
-          content?.videoDescriptionMusicSectionRenderer?.items ||
-          [];
-        console.log(`[yt-diag] desc-panel items: ${items.length}`);
-        items.slice(0, 10).forEach((item, i) => {
-          console.log(`[yt-diag] item[${i}] keys: [${Object.keys(item || {}).join(", ")}]`);
-        });
-      } else {
-        console.log(`[yt-diag] no description panel found`);
-        console.log(`[yt-diag] response top-level keys: [${Object.keys(data || {}).join(", ")}]`);
-      }
-
-      // Search the entire response for any key containing "music"
-      const musicKeys = [...findKeysContaining(data, "music")];
-      console.log(`[yt-diag] all keys containing "music": [${musicKeys.join(", ")}]`);
-    }
-
-    const musicSections = findMusicSections(data);
+    const musicSections = findMusicSections(res.data);
     const tracks = parseMusicSectionsToTracks(musicSections);
     console.log(`[yt-next] ${videoId}: sections=${musicSections.length} tracks=${tracks.length}`);
     return tracks;
