@@ -797,7 +797,7 @@ function extractYtMusicTracksViaYtDlp(videoId) {
     "--skip-download",
     "--no-playlist",
     "-q",
-    "--extractor-args", "youtube:player_client=mweb,ios,tv_embedded,android",
+    "--extractor-args", "youtube:player_client=mweb,ios,android",
     `https://www.youtube.com/watch?v=${videoId}`,
   ], { timeout: 60000, encoding: "utf8", env });
 
