@@ -49,7 +49,7 @@ app.post("/preview", auth, async (req, res) => {
 // Fingerprint queue — caps concurrent DB+yt-dlp+ffmpeg jobs at FP_CONCURRENCY
 // regardless of how many /fingerprint-song requests arrive at once.
 let fpRunning = 0;
-const FP_CONCURRENCY = 3;
+const FP_CONCURRENCY = 1;
 const fpQueue = [];
 const fpQueued = new Set(); // deduplicate: ignore re-queued songs already waiting
 
