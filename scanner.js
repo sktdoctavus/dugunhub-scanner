@@ -749,90 +749,93 @@ function findMusicSections(obj, depth = 0, results = []) {
   return results;
 }
 
-// Extract "Music in this video" tracks by fetching the YouTube watch page HTML and
-// parsing ytInitialData. No yt-dlp needed — works on any IP without PO tokens.
+// Parse tracks out of a list of videoDescriptionMusicSectionRenderer nodes.
+function parseMusicSectionsToTracks(musicSections) {
+  const tracks = [];
+  for (const section of musicSections) {
+    for (const lockup of section?.carouselLockups || []) {
+      const lr = lockup?.carouselLockupRenderer;
+      if (!lr) continue;
+      const track = {};
+
+      // Song title may be in the videoLockup sub-renderer
+      const vl = lr?.videoLockup?.videoLockupRenderer;
+      if (vl) {
+        const t = getText(vl?.title);
+        if (t) track.title = t;
+      }
+
+      // Info rows: Song / Artist / Album
+      for (const row of lr?.infoRows || []) {
+        const info = row?.infoRowRenderer;
+        if (!info) continue;
+        const label = (getText(info.title) || "").toLowerCase();
+        const value = getText(info.defaultMetadata) || getText(info.expandedMetadata);
+        if (!value) continue;
+        if (label === "song"   || label === "şarkı")   track.title  = value;
+        else if (label === "artist" || label === "sanatçı") track.artist = value;
+        else if (label === "album"  || label === "albüm")  track.album  = value;
+      }
+
+      if (track.title || track.artist) tracks.push(track);
+    }
+  }
+  return tracks;
+}
+
+// Extract "Music in this video" tracks via YouTube's InnerTube /next API.
+// This is the same JSON endpoint the YouTube frontend uses to load the description
+// panel — it returns the full structured description including music sections,
+// without requiring HTML parsing or PO tokens.
 // Returns [{title, artist, album}].
 async function extractYtMusicTracks(videoId, attempt = 1) {
-  const url = `https://www.youtube.com/watch?v=${videoId}&hl=en`;
   try {
-    const res = await axios.get(url, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Cookie": "SOCS=CAI",
+    const res = await axios.post(
+      "https://www.youtube.com/youtubei/v1/next",
+      {
+        videoId,
+        context: {
+          client: {
+            clientName: "WEB",
+            clientVersion: "2.20240101.00.00",
+            hl: "en",
+            gl: "US",
+          },
+        },
       },
-      timeout: 30000,
-      decompress: true,
-    });
-
-    const html = typeof res.data === "string" ? res.data : JSON.stringify(res.data);
-
-    // Extract ytInitialData via brace-counting from its assignment in the page script
-    const marker = "var ytInitialData = ";
-    const markerIdx = html.indexOf(marker);
-    if (markerIdx === -1) {
-      console.log(`[yt-html] ${videoId}: ytInitialData not found in page`);
-      return [];
-    }
-
-    const jsonStart = markerIdx + marker.length;
-    let depth = 0, jsonEnd = -1;
-    for (let i = jsonStart; i < html.length; i++) {
-      const c = html[i];
-      if (c === "{") depth++;
-      else if (c === "}") { if (--depth === 0) { jsonEnd = i + 1; break; } }
-    }
-    if (jsonEnd === -1) return [];
-
-    let ytData;
-    try { ytData = JSON.parse(html.slice(jsonStart, jsonEnd)); }
-    catch { console.log(`[yt-html] ${videoId}: JSON parse failed`); return []; }
-
-    const musicSections = findMusicSections(ytData);
-    console.log(`[yt-html] ${videoId}: found ${musicSections.length} music section(s)`);
-
-    const tracks = [];
-    for (const section of musicSections) {
-      for (const lockup of section?.carouselLockups || []) {
-        const lr = lockup?.carouselLockupRenderer;
-        if (!lr) continue;
-        const track = {};
-
-        // Song title is often in the videoLockup sub-renderer
-        const vl = lr?.videoLockup?.videoLockupRenderer;
-        if (vl) {
-          const t = getText(vl?.title);
-          if (t) track.title = t;
-        }
-
-        // Info rows carry Song / Artist / Album labels
-        for (const row of lr?.infoRows || []) {
-          const info = row?.infoRowRenderer;
-          if (!info) continue;
-          const label = (getText(info.title) || "").toLowerCase();
-          const value = getText(info.defaultMetadata) || getText(info.expandedMetadata);
-          if (!value) continue;
-          if (label === "song" || label === "şarkı") track.title = value;
-          else if (label === "artist" || label === "sanatçı") track.artist = value;
-          else if (label === "album" || label === "albüm") track.album = value;
-        }
-
-        if (track.title || track.artist) tracks.push(track);
+      {
+        headers: {
+          "Content-Type": "application/json",
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+          "Origin": "https://www.youtube.com",
+          "Referer": `https://www.youtube.com/watch?v=${videoId}`,
+          "Cookie": "SOCS=CAI",
+        },
+        timeout: 30000,
       }
+    );
+
+    const data = res.data;
+    const panels = data?.engagementPanels || [];
+    const musicSections = findMusicSections(data);
+
+    // Log the panel structure once per process start so we can diagnose if needed
+    if (attempt === 1 && videoId === (global._ytDiagVideoId || videoId)) {
+      global._ytDiagVideoId = null; // only log once
+      console.log(`[yt-next] ${videoId}: status=${res.status} panels=${panels.length} musicSections=${musicSections.length}`);
     }
 
-    console.log(`[yt-html] ${videoId}: returning ${tracks.length} track(s)`);
+    const tracks = parseMusicSectionsToTracks(musicSections);
+    console.log(`[yt-next] ${videoId}: panels=${panels.length} sections=${musicSections.length} tracks=${tracks.length}`);
     return tracks;
   } catch (e) {
     if (e.response?.status === 429 && attempt <= 3) {
-      // YouTube rate limit — back off exponentially: 2min, 4min, 8min
       const waitMs = Math.pow(2, attempt) * 60000;
-      console.log(`[yt-html] ${videoId}: 429 rate limit, waiting ${waitMs / 60000}min (attempt ${attempt}/3)`);
+      console.log(`[yt-next] ${videoId}: 429 rate limit, waiting ${waitMs / 60000}min (attempt ${attempt}/3)`);
       await new Promise((r) => setTimeout(r, waitMs));
       return extractYtMusicTracks(videoId, attempt + 1);
     }
-    console.error(`[yt-html] ${videoId}: ${e.message.slice(0, 200)}`);
+    console.error(`[yt-next] ${videoId}: HTTP ${e.response?.status || "?"} — ${e.message.slice(0, 200)}`);
     return [];
   }
 }
