@@ -729,58 +729,104 @@ async function debugMatch(youtubeUrl, startSec = 0) {
   }
 }
 
-// Extract the "Music in this video" tracks that YouTube detected for a single video.
-// Uses yt-dlp -j (metadata only, no download). Returns [{title, artist, album}].
-function extractYtMusicTracks(videoId) {
-  const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
-  const args = [
-    "--skip-download", "--no-playlist", "-j",
-    // The "Music in this video" data lives in YouTube engagement panels inside ytInitialData.
-    // Only the web (desktop) client fetches the full YouTube watch page HTML that contains
-    // these panels. InnerTube API clients (android, ios, mweb, tv_embedded, web_embedded)
-    // return stripped JSON responses that never include engagement panel data.
-    "--extractor-args", "youtube:player_client=web",
-  ];
-  if (process.env.YTDLP_PROXY) args.push("--proxy", process.env.YTDLP_PROXY);
-  args.push(videoUrl);
+// Flatten a YouTube text object { simpleText } or { runs: [{text}] } to a plain string.
+function getText(obj) {
+  if (!obj) return null;
+  if (typeof obj.simpleText === "string") return obj.simpleText;
+  if (Array.isArray(obj.runs)) return obj.runs.map((r) => r.text || "").join("");
+  return null;
+}
 
-  // Strip any system proxy env vars so yt-dlp doesn't pick them up via Python urllib
-  const env = { ...process.env };
-  delete env.HTTP_PROXY; delete env.HTTPS_PROXY;
-  delete env.http_proxy; delete env.https_proxy;
-  delete env.ALL_PROXY;  delete env.all_proxy;
+// Recursively find all videoDescriptionMusicSectionRenderer nodes in ytInitialData.
+function findMusicSections(obj, depth = 0, results = []) {
+  if (!obj || depth > 30 || typeof obj !== "object") return results;
+  if (obj.videoDescriptionMusicSectionRenderer) {
+    results.push(obj.videoDescriptionMusicSectionRenderer);
+    return results; // don't recurse into found node
+  }
+  const children = Array.isArray(obj) ? obj : Object.values(obj);
+  for (const child of children) findMusicSections(child, depth + 1, results);
+  return results;
+}
 
-  // web client fetches a full HTML page — allow more time than API-based clients
-  const result = spawnSync("yt-dlp", args, { timeout: 60000, encoding: "utf8", env });
+// Extract "Music in this video" tracks by fetching the YouTube watch page HTML and
+// parsing ytInitialData. No yt-dlp needed — works on any IP without PO tokens.
+// Returns [{title, artist, album}].
+async function extractYtMusicTracks(videoId) {
+  const url = `https://www.youtube.com/watch?v=${videoId}&hl=en`;
+  try {
+    const res = await axios.get(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      },
+      timeout: 30000,
+      decompress: true,
+    });
 
-  console.log(`[yt-meta] ${videoId}: exit=${result.status} stdout_len=${result.stdout?.length || 0} stderr_snippet=${result.stderr?.slice(0, 200)}`);
+    const html = typeof res.data === "string" ? res.data : JSON.stringify(res.data);
 
-  if (result.status !== 0 || !result.stdout?.trim()) return [];
-
-  let info;
-  try { info = JSON.parse(result.stdout); } catch { return []; }
-
-  console.log(`[yt-meta] ${videoId}: has_music=${Array.isArray(info.music)} music_len=${info.music?.length || 0} top_track=${info.track || "-"} top_artist=${info.artist || "-"}`);
-
-  const tracks = [];
-
-  // yt-dlp stores the "Music in this video" panel as info.music — keys may be capitalized
-  if (Array.isArray(info.music)) {
-    for (const m of info.music) {
-      const title  = m.track  || m.Track  || m.Song   || m.song   || null;
-      const artist = m.artist || m.Artist || null;
-      const album  = m.album  || m.Album  || null;
-      if (title || artist) tracks.push({ title, artist, album });
+    // Extract ytInitialData via brace-counting from its assignment in the page script
+    const marker = "var ytInitialData = ";
+    const markerIdx = html.indexOf(marker);
+    if (markerIdx === -1) {
+      console.log(`[yt-html] ${videoId}: ytInitialData not found in page`);
+      return [];
     }
-  }
 
-  // Fallback: single-track music videos expose top-level track/artist fields
-  if (tracks.length === 0 && (info.track || info.artist)) {
-    tracks.push({ title: info.track || null, artist: info.artist || null, album: info.album || null });
-  }
+    const jsonStart = markerIdx + marker.length;
+    let depth = 0, jsonEnd = -1;
+    for (let i = jsonStart; i < html.length; i++) {
+      const c = html[i];
+      if (c === "{") depth++;
+      else if (c === "}") { if (--depth === 0) { jsonEnd = i + 1; break; } }
+    }
+    if (jsonEnd === -1) return [];
 
-  console.log(`[yt-meta] ${videoId}: returning ${tracks.length} tracks`);
-  return tracks;
+    let ytData;
+    try { ytData = JSON.parse(html.slice(jsonStart, jsonEnd)); }
+    catch { console.log(`[yt-html] ${videoId}: JSON parse failed`); return []; }
+
+    const musicSections = findMusicSections(ytData);
+    console.log(`[yt-html] ${videoId}: found ${musicSections.length} music section(s)`);
+
+    const tracks = [];
+    for (const section of musicSections) {
+      for (const lockup of section?.carouselLockups || []) {
+        const lr = lockup?.carouselLockupRenderer;
+        if (!lr) continue;
+        const track = {};
+
+        // Song title is often in the videoLockup sub-renderer
+        const vl = lr?.videoLockup?.videoLockupRenderer;
+        if (vl) {
+          const t = getText(vl?.title);
+          if (t) track.title = t;
+        }
+
+        // Info rows carry Song / Artist / Album labels
+        for (const row of lr?.infoRows || []) {
+          const info = row?.infoRowRenderer;
+          if (!info) continue;
+          const label = (getText(info.title) || "").toLowerCase();
+          const value = getText(info.defaultMetadata) || getText(info.expandedMetadata);
+          if (!value) continue;
+          if (label === "song" || label === "şarkı") track.title = value;
+          else if (label === "artist" || label === "sanatçı") track.artist = value;
+          else if (label === "album" || label === "albüm") track.album = value;
+        }
+
+        if (track.title || track.artist) tracks.push(track);
+      }
+    }
+
+    console.log(`[yt-html] ${videoId}: returning ${tracks.length} track(s)`);
+    return tracks;
+  } catch (e) {
+    console.error(`[yt-html] ${videoId}: ${e.message.slice(0, 200)}`);
+    return [];
+  }
 }
 
 // YouTube-metadata-based scan: resolves a URL to videos, extracts Content ID music data,
@@ -794,8 +840,8 @@ async function ytMetaScan(youtubeUrl) {
 
   for (let i = 0; i < videos.length; i += CONCURRENCY) {
     const batch = videos.slice(i, i + CONCURRENCY);
-    const batchResults = await Promise.all(batch.map((video) => {
-      const detectedTracks = extractYtMusicTracks(video.id);
+    const batchResults = await Promise.all(batch.map(async (video) => {
+      const detectedTracks = await extractYtMusicTracks(video.id);
       const dangerousMatches = [];
       for (const track of detectedTracks) {
         const hit = matchesDangerSong(track, dangerSongs);
@@ -952,7 +998,6 @@ async function monitorUserChannel(userId) {
 
   for (let i = 0; i < newVideos.length; i += CONCURRENCY) {
     const batch = newVideos.slice(i, i + CONCURRENCY);
-    // Process sequentially within each batch (extractYtMusicTracks uses spawnSync)
     for (const video of batch) {
       // Mark as currently scanning
       await supabase.from("channel_scan_progress")
@@ -961,7 +1006,7 @@ async function monitorUserChannel(userId) {
         .eq("scan_id", scanId)
         .eq("video_id", video.id);
 
-      const detectedTracks = extractYtMusicTracks(video.id);
+      const detectedTracks = await extractYtMusicTracks(video.id);
 
       await supabase.from("video_music_cache").upsert({
         user_id: userId,
