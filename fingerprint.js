@@ -45,13 +45,21 @@ function resolveStreamUrl(videoUrl) {
     } catch (_) { /* ignore */ }
   }
 
-  // Explicitly set proxy to disable any system HTTP_PROXY/HTTPS_PROXY env vars
-  // that Railway may inject — yt-dlp (Python urllib) picks these up automatically.
-  // If YTDLP_PROXY is set, use it; otherwise force no proxy with empty string.
-  ytArgs.push("--proxy", process.env.YTDLP_PROXY || "");
+  if (process.env.YTDLP_PROXY) ytArgs.push("--proxy", process.env.YTDLP_PROXY);
   ytArgs.push(videoUrl);
 
-  const result = spawnSync("yt-dlp", ytArgs, { timeout: 60000, encoding: "utf8" });
+  // Strip all proxy env vars from the child process — yt-dlp (Python urllib) automatically
+  // inherits HTTP_PROXY/HTTPS_PROXY from the environment even without --proxy flag,
+  // and --proxy "" is falsy so Python falls back to getproxies() anyway.
+  const ytEnv = { ...process.env };
+  delete ytEnv.HTTP_PROXY;
+  delete ytEnv.HTTPS_PROXY;
+  delete ytEnv.http_proxy;
+  delete ytEnv.https_proxy;
+  delete ytEnv.ALL_PROXY;
+  delete ytEnv.all_proxy;
+
+  const result = spawnSync("yt-dlp", ytArgs, { timeout: 60000, encoding: "utf8", env: ytEnv });
   if (result.status !== 0 || !result.stdout?.trim()) {
     throw new Error(
       `yt-dlp -g failed (exit ${result.status}): ${(result.stderr || "").slice(0, 400)}`
