@@ -170,10 +170,10 @@ app.post("/yt-meta-scan", auth, async (req, res) => {
 
 // Monitor a user's YouTube channel for new dangerous songs — fire-and-forget
 app.post("/channel-monitor", auth, async (req, res) => {
-  const { userId } = req.body;
+  const { userId, fingerprint = false } = req.body;
   if (!userId) return res.status(400).json({ error: "userId required" });
-  res.json({ status: "accepted", userId });
-  monitorUserChannel(userId).catch((e) => console.error(`Channel monitor ${userId} failed:`, e.message));
+  res.json({ status: "accepted", userId, fingerprint });
+  monitorUserChannel(userId, { fingerprint }).catch((e) => console.error(`Channel monitor ${userId} failed:`, e.message));
 });
 
 // Start a scan job — job must already exist in Supabase scan_jobs table

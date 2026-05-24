@@ -1022,8 +1022,9 @@ async function monitorVideoFingerprint(video, dangerSongsWithFp) {
 // Fetches ALL channel videos upfront for the progress display, then processes
 // only uncached ones. Updates channel_scan_progress in real time so the UI
 // can show per-video status as the scan runs.
-async function monitorUserChannel(userId) {
-  console.log(`[monitor] starting for user ${userId}`);
+async function monitorUserChannel(userId, options = {}) {
+  const doFingerprint = options.fingerprint === true;
+  console.log(`[monitor] starting for user ${userId} (fingerprint=${doFingerprint})`);
   const { data: profile, error: profileErr } = await supabase
     .from("profiles")
     .select("youtube, channel_last_scanned_at")
@@ -1095,8 +1096,8 @@ async function monitorUserChannel(userId) {
 
   const newVideos = allVideos.filter((v) => !cachedIds.has(v.id));
   const dangerSongs = await loadDangerSongs();
-  const dangerSongsWithFp = await loadDangerSongsWithFingerprints();
-  console.log(`[monitor] ${dangerSongs.length} danger songs, ${dangerSongsWithFp.length} with fingerprints, ${newVideos.length} videos to scan`);
+  const dangerSongsWithFp = doFingerprint ? await loadDangerSongsWithFingerprints() : [];
+  console.log(`[monitor] ${dangerSongs.length} danger songs, ${dangerSongsWithFp.length} with fingerprints, ${newVideos.length} videos to scan (fingerprint=${doFingerprint})`);
 
   // CONCURRENCY=3: process 3 videos in parallel without saturating Railway CPU
   const CONCURRENCY = 3;
@@ -1111,7 +1112,7 @@ async function monitorUserChannel(userId) {
         .eq("user_id", userId).eq("scan_id", scanId).eq("video_id", video.id);
 
       const metaTracks = await extractYtMusicTracks(video.id);
-      const fpMatches = await monitorVideoFingerprint(video, dangerSongsWithFp);
+      const fpMatches = doFingerprint ? await monitorVideoFingerprint(video, dangerSongsWithFp) : [];
 
       await supabase.from("video_music_cache").upsert({
         user_id: userId,
