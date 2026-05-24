@@ -735,12 +735,20 @@ function extractYtMusicTracks(videoId) {
   const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
   const args = [
     "--skip-download", "--no-playlist", "-j",
-    "--extractor-args", "youtube:player_client=tv_embedded,web_embedded,android_vr,android",
+    // mweb fetches the full mobile YouTube page including engagement panels (Music in this video).
+    // Embedded/android clients return stripped responses without music metadata.
+    "--extractor-args", "youtube:player_client=mweb,ios",
   ];
   if (process.env.YTDLP_PROXY) args.push("--proxy", process.env.YTDLP_PROXY);
   args.push(videoUrl);
 
-  const result = spawnSync("yt-dlp", args, { timeout: 30000, encoding: "utf8" });
+  // Strip any system proxy env vars so yt-dlp doesn't pick them up via Python urllib
+  const env = { ...process.env };
+  delete env.HTTP_PROXY; delete env.HTTPS_PROXY;
+  delete env.http_proxy; delete env.https_proxy;
+  delete env.ALL_PROXY;  delete env.all_proxy;
+
+  const result = spawnSync("yt-dlp", args, { timeout: 30000, encoding: "utf8", env });
   if (result.status !== 0 || !result.stdout?.trim()) return [];
 
   let info;
