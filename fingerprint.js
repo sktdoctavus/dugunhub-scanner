@@ -76,7 +76,8 @@ async function downloadSegment(streamUrl, startSec, durationSec, tmpDir) {
 
   const ffArgs = ["-ss", String(startSec)];
   if (durationSec != null) ffArgs.push("-t", String(durationSec));
-  if (process.env.YTDLP_PROXY) ffArgs.push("-http_proxy", process.env.YTDLP_PROXY);
+  // No proxy for ffmpeg — YouTube CDN URLs are time-signed, not IP-locked.
+  // Only yt-dlp -g (stream URL resolution) needs the residential proxy.
   ffArgs.push(
     "-i", streamUrl,
     "-ac", "1",

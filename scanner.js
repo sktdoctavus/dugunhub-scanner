@@ -1095,7 +1095,8 @@ async function monitorUserChannel(userId) {
 
   const newVideos = allVideos.filter((v) => !cachedIds.has(v.id));
   const dangerSongs = await loadDangerSongs();
-  console.log(`[monitor] ${dangerSongs.length} danger songs, ${newVideos.length} videos to scan`);
+  const dangerSongsWithFp = await loadDangerSongsWithFingerprints();
+  console.log(`[monitor] ${dangerSongs.length} danger songs, ${dangerSongsWithFp.length} with fingerprints, ${newVideos.length} videos to scan`);
 
   // CONCURRENCY=3: process 3 videos in parallel without saturating Railway CPU
   const CONCURRENCY = 3;
@@ -1110,6 +1111,7 @@ async function monitorUserChannel(userId) {
         .eq("user_id", userId).eq("scan_id", scanId).eq("video_id", video.id);
 
       const metaTracks = await extractYtMusicTracks(video.id);
+      const fpMatches = await monitorVideoFingerprint(video, dangerSongsWithFp);
 
       await supabase.from("video_music_cache").upsert({
         user_id: userId,
@@ -1125,7 +1127,7 @@ async function monitorUserChannel(userId) {
       let alertCount = 0;
       const alertedSongIds = new Set();
 
-      // Content ID tracks → text-match against danger songs
+      // Content ID tracks → text-match against danger_songs
       for (const track of metaTracks) {
         const hit = matchesDangerSong(track, dangerSongs);
         if (!hit || alertedSongIds.has(hit.id)) continue;
@@ -1137,6 +1139,24 @@ async function monitorUserChannel(userId) {
             user_id: userId, video_id: video.id, video_title: video.title, video_url: video.url,
             danger_song_id: hit.id, danger_song_title: hit.title, danger_song_artist: hit.artist,
             claimant: hit.claimant, match_type: hit.match_type || "song",
+            match_source: "content_id", detected_at_sec: null,
+          });
+          newAlerts++; alertCount++;
+        }
+      }
+
+      // Fingerprint matches → store exact timecode (second where match was found)
+      for (const { song, atSec } of fpMatches) {
+        if (alertedSongIds.has(song.id)) continue;
+        alertedSongIds.add(song.id);
+        const { data: existing } = await supabase.from("channel_alerts")
+          .select("id").eq("user_id", userId).eq("video_id", video.id).eq("danger_song_id", song.id).maybeSingle();
+        if (!existing) {
+          await supabase.from("channel_alerts").insert({
+            user_id: userId, video_id: video.id, video_title: video.title, video_url: video.url,
+            danger_song_id: song.id, danger_song_title: song.title, danger_song_artist: song.artist,
+            claimant: song.claimant, match_type: song.match_type || "song",
+            match_source: "fingerprint", detected_at_sec: atSec,
           });
           newAlerts++; alertCount++;
         }
