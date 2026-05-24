@@ -976,7 +976,7 @@ async function fetchPlaylistVideosSince(playlistId, sinceDate) {
 }
 
 // Fingerprint a single video against the danger_songs database.
-// Checks 3×15s segments from the first 90s of the video.
+// Samples every 60s throughout the full video — ±60s timecode precision.
 // Returns [{song: dangerSongRow, atSec: number}] for each distinct match.
 async function monitorVideoFingerprint(video, dangerSongsWithFp) {
   if (!dangerSongsWithFp || dangerSongsWithFp.length === 0) return [];
@@ -989,8 +989,11 @@ async function monitorVideoFingerprint(video, dangerSongsWithFp) {
   }
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "dh-mfp-"));
-  const maxSec = video.durationSec || 999;
-  const segments = [0, 30, 60].filter(s => s < maxSec);
+  const maxSec = video.durationSec || 600;
+  // Sample every 60s throughout the full video — proxy cost is the same
+  // (stream URL resolved once); only ffmpeg time scales with segment count
+  const segments = [];
+  for (let s = 0; s < maxSec; s += 60) segments.push(s);
   const matchedIds = new Set();
   const matches = [];
 
