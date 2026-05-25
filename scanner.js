@@ -1083,6 +1083,7 @@ async function monitorVideoFingerprint(video, dangerSongsWithFp) {
 async function monitorUserChannel(userId, options = {}) {
   const doFingerprint = options.fingerprint === true;
   console.log(`[monitor] starting for user ${userId} (fingerprint=${doFingerprint})`);
+  console.log(`[monitor] env: YTDLP_PROXY=${!!process.env.YTDLP_PROXY}(${(process.env.YTDLP_PROXY||"").length}ch) YTDLP_COOKIES=${!!process.env.YTDLP_COOKIES}(${(process.env.YTDLP_COOKIES||"").length}ch) YTDLP_COOKIES_B64=${!!process.env.YTDLP_COOKIES_B64}(${(process.env.YTDLP_COOKIES_B64||"").length}ch)`);
   const { data: profile, error: profileErr } = await supabase
     .from("profiles")
     .select("youtube, channel_last_scanned_at")
