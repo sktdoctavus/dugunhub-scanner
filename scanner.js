@@ -827,33 +827,93 @@ async function fetchYtInitialData(videoId) {
   const marker = "var ytInitialData = ";
   const start = html.indexOf(marker);
   if (start === -1) {
-    console.log(`[yt-page] ${videoId}: ytInitialData not found in HTML`);
+    const botPage = html.includes("Sign in to confirm");
+    console.log(`[yt-page] ${videoId}: ytInitialData not found — ${html.length} bytes, HTTP ${res.status}${botPage ? " [BOT DETECTION PAGE]" : ""}`);
     return null;
   }
   const jsonStart = start + marker.length;
-  const end = html.indexOf(";</script>", jsonStart);
-  if (end === -1) return null;
+  // Use </script> not ;</script> — YouTube HTML sometimes has \n before </script>
+  const end = html.indexOf("</script>", jsonStart);
+  if (end === -1) {
+    console.log(`[yt-page] ${videoId}: </script> end marker not found`);
+    return null;
+  }
+  let jsonStr = html.slice(jsonStart, end).trimEnd();
+  if (jsonStr.endsWith(";")) jsonStr = jsonStr.slice(0, -1);
+  console.log(`[yt-page] ${videoId}: parsing JSON (${jsonStr.length} chars), HTTP ${res.status}`);
   try {
-    return JSON.parse(html.slice(jsonStart, end));
+    return JSON.parse(jsonStr);
   } catch (e) {
     console.error(`[yt-page] ${videoId}: JSON parse error — ${e.message.slice(0, 100)}`);
+    console.error(`[yt-page] ${videoId}: JSON tail: ${jsonStr.slice(-150)}`);
     return null;
   }
 }
 
-// Extract "Music in this video" tracks by fetching the YouTube watch page directly.
-// Uses findMusicSections + parseMusicSectionsToTracks on the page's ytInitialData.
+// Extract "Music in this video" tracks.
+// PRIMARY: yt-dlp --dump-json with web client + proxy + cookies (same pattern as resolveStreamUrl).
+//   The missing --proxy flag was the root cause of all previous yt-dlp failures.
+// FALLBACK: direct axios GET of the watch page HTML → parse ytInitialData.
 // Returns [{title, artist, album}].
 async function extractYtMusicTracks(videoId) {
+  const ytArgs = [
+    "--dump-json", "--no-playlist",
+    "--extractor-args", "youtube:player_client=web",
+  ];
+
+  const rawCookies = process.env.YTDLP_COOKIES || process.env.YTDLP_COOKIES_B64;
+  let cookieTmp = null;
+  if (rawCookies) {
+    cookieTmp = path.join(os.tmpdir(), "yt_music_cookies.txt");
+    try {
+      const content = rawCookies.trimStart().startsWith("#")
+        ? rawCookies
+        : Buffer.from(rawCookies, "base64").toString("utf8");
+      fs.writeFileSync(cookieTmp, content);
+      ytArgs.push("--cookies", cookieTmp);
+    } catch (_) { cookieTmp = null; }
+  }
+
+  if (process.env.YTDLP_PROXY) ytArgs.push("--proxy", process.env.YTDLP_PROXY);
+  ytArgs.push(`https://www.youtube.com/watch?v=${videoId}`);
+
+  const ytEnv = { ...process.env };
+  delete ytEnv.HTTP_PROXY; delete ytEnv.HTTPS_PROXY;
+  delete ytEnv.http_proxy; delete ytEnv.https_proxy;
+  delete ytEnv.ALL_PROXY;  delete ytEnv.all_proxy;
+
+  console.log(`[yt-music] ${videoId}: yt-dlp web client (proxy=${!!process.env.YTDLP_PROXY}, cookies=${!!cookieTmp})`);
+  const result = spawnSync("yt-dlp", ytArgs, { timeout: 60000, encoding: "utf8", env: ytEnv });
+  if (cookieTmp) try { fs.unlinkSync(cookieTmp); } catch (_) {}
+
+  if (result.status === 0 && result.stdout?.trim()) {
+    try {
+      const info = JSON.parse(result.stdout);
+      const tracks = (info.music || [])
+        .map((m) => ({ title: m.song || null, artist: m.artist || null, album: m.album || null }))
+        .filter((t) => t.title || t.artist);
+      console.log(`[yt-music] ${videoId}: yt-dlp OK → ${tracks.length} tracks`);
+      return tracks;
+    } catch (e) {
+      console.error(`[yt-music] ${videoId}: yt-dlp JSON parse: ${e.message.slice(0, 100)}`);
+    }
+  } else {
+    console.error(`[yt-music] ${videoId}: yt-dlp exit ${result.status} — ${(result.stderr || "").slice(0, 300)}`);
+  }
+
+  console.log(`[yt-music] ${videoId}: falling back to axios page fetch`);
   try {
     const ytInitialData = await fetchYtInitialData(videoId);
-    if (!ytInitialData) return [];
+    if (!ytInitialData) {
+      console.log(`[yt-music] ${videoId}: axios fallback → ytInitialData null`);
+      return [];
+    }
     const musicSections = findMusicSections(ytInitialData);
     const tracks = parseMusicSectionsToTracks(musicSections);
-    console.log(`[yt-page] ${videoId}: ${musicSections.length} sections → ${tracks.length} tracks`);
+    console.log(`[yt-music] ${videoId}: axios fallback → ${musicSections.length} sections, ${tracks.length} tracks`);
     return tracks;
   } catch (e) {
-    console.error(`[yt-page] ${videoId}: ${e.message.slice(0, 200)}`);
+    console.error(`[yt-music] ${videoId}: axios fallback: ${e.message.slice(0, 200)}`);
     return [];
   }
 }
