@@ -797,7 +797,7 @@ function extractYtMusicTracksViaYtDlp(videoId) {
     "--skip-download",
     "--no-playlist",
     "-q",
-    "--extractor-args", "youtube:player_client=mweb,ios,android",
+    "--extractor-args", "youtube:player_client=web",
   ];
   if (process.env.YTDLP_PROXY) ytArgs.push("--proxy", process.env.YTDLP_PROXY);
   ytArgs.push(`https://www.youtube.com/watch?v=${videoId}`);
@@ -1199,7 +1199,7 @@ async function monitorUserChannel(userId, options = {}) {
       .select("channel_scan_started_at")
       .eq("id", userId)
       .single();
-    if (cancelCheck?.channel_scan_started_at !== scanId) {
+    if (!cancelCheck?.channel_scan_started_at) {
       console.log(`[monitor] scan cancelled by user, stopping`);
       break;
     }
