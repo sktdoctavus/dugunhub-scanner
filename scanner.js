@@ -871,7 +871,10 @@ async function extractYtMusicTracks(videoId) {
         : Buffer.from(rawCookies, "base64").toString("utf8");
       fs.writeFileSync(cookieTmp, content);
       ytArgs.push("--cookies", cookieTmp);
-    } catch (_) { cookieTmp = null; }
+    } catch (e) {
+      console.error(`[yt-music] cookie write failed: ${e.message}`);
+      cookieTmp = null;
+    }
   }
 
   if (process.env.YTDLP_PROXY) ytArgs.push("--proxy", process.env.YTDLP_PROXY);
@@ -910,7 +913,15 @@ async function extractYtMusicTracks(videoId) {
     }
     const musicSections = findMusicSections(ytInitialData);
     const tracks = parseMusicSectionsToTracks(musicSections);
-    console.log(`[yt-music] ${videoId}: axios fallback → ${musicSections.length} sections, ${tracks.length} tracks`);
+    if (tracks.length === 0) {
+      const raw = JSON.stringify(ytInitialData);
+      const hasMusicSection = raw.includes("MusicSection");
+      const hasMusicRenderer = raw.includes("musicRenderer");
+      const hasEngagementMusic = raw.includes("engagementPanel") && raw.includes("music");
+      console.log(`[yt-music] ${videoId}: axios 0 tracks — MusicSection=${hasMusicSection} musicRenderer=${hasMusicRenderer} engagementMusic=${hasEngagementMusic} jsonLen=${raw.length}`);
+    } else {
+      console.log(`[yt-music] ${videoId}: axios fallback → ${musicSections.length} sections, ${tracks.length} tracks`);
+    }
     return tracks;
   } catch (e) {
     console.error(`[yt-music] ${videoId}: axios fallback: ${e.message.slice(0, 200)}`);

@@ -195,5 +195,7 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`DüğünHub scanner worker listening on port ${PORT}`);
   console.log(`[config] AUDD_API_TOKEN set: ${!!process.env.AUDD_API_TOKEN}`);
-  console.log(`[config] YTDLP_PROXY set: ${!!process.env.YTDLP_PROXY}`);
+  console.log(`[config] YTDLP_PROXY set: ${!!process.env.YTDLP_PROXY} (${(process.env.YTDLP_PROXY || "").length} chars)`);
+  console.log(`[config] YTDLP_COOKIES set: ${!!process.env.YTDLP_COOKIES} (${(process.env.YTDLP_COOKIES || "").length} chars)`);
+  console.log(`[config] YTDLP_COOKIES_B64 set: ${!!process.env.YTDLP_COOKIES_B64} (${(process.env.YTDLP_COOKIES_B64 || "").length} chars)`);
 });
