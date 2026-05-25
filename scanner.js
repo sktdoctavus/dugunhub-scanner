@@ -792,14 +792,17 @@ function extractYtMusicTracksViaYtDlp(videoId) {
   delete env.http_proxy; delete env.https_proxy;
   delete env.ALL_PROXY;  delete env.all_proxy;
 
-  const result = spawnSync("yt-dlp", [
+  const ytArgs = [
     "--dump-json",
     "--skip-download",
     "--no-playlist",
     "-q",
     "--extractor-args", "youtube:player_client=mweb,ios,android",
-    `https://www.youtube.com/watch?v=${videoId}`,
-  ], { timeout: 60000, encoding: "utf8", env });
+  ];
+  if (process.env.YTDLP_PROXY) ytArgs.push("--proxy", process.env.YTDLP_PROXY);
+  ytArgs.push(`https://www.youtube.com/watch?v=${videoId}`);
+
+  const result = spawnSync("yt-dlp", ytArgs, { timeout: 60000, encoding: "utf8", env });
 
   // Only bail when stdout is truly empty. Exit code 1 can mean "Signature solving
   // failed" — a WARNING about streaming formats, not a metadata failure. yt-dlp
@@ -990,27 +993,42 @@ async function monitorVideoFingerprint(video, dangerSongsWithFp) {
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "dh-mfp-"));
   const maxSec = video.durationSec || 600;
-  // Sample every 60s throughout the full video — proxy cost is the same
-  // (stream URL resolved once); only ffmpeg time scales with segment count
+  const SEGMENT_CONCURRENCY = 8;
   const segments = [];
-  for (let s = 0; s < maxSec; s += 60) segments.push(s);
+  for (let s = 0; s < maxSec; s += 30) segments.push(s);
   const matchedIds = new Set();
   const matches = [];
 
   try {
-    for (const startSec of segments) {
-      try {
-        const audioPath = await downloadSegment(streamUrl, startSec, 15, tmpDir);
-        const { fingerprint: clipFp } = getFingerprintFromFile(audioPath);
-        try { fs.unlinkSync(audioPath); } catch {}
-        const hit = matchFingerprintToDangerSongs(clipFp, dangerSongsWithFp);
-        if (hit && !matchedIds.has(hit.song.id)) {
-          matchedIds.add(hit.song.id);
-          matches.push({ song: hit.song, atSec: startSec });
-          console.log(`[monitor-fp] ${video.id}: MATCH "${hit.song.title}" at ${startSec}s (BER=${hit.ber.toFixed(3)})`);
+    for (let i = 0; i < segments.length; i += SEGMENT_CONCURRENCY) {
+      const batch = segments.slice(i, i + SEGMENT_CONCURRENCY);
+
+      // Phase 1: download all segments in the batch concurrently (ffmpeg is async/non-blocking)
+      const downloaded = await Promise.all(batch.map(async (startSec) => {
+        try {
+          const audioPath = await downloadSegment(streamUrl, startSec, 15, tmpDir);
+          return { startSec, audioPath };
+        } catch (e) {
+          console.error(`[monitor-fp] ${video.id}@${startSec}s: ${e.message.slice(0, 150)}`);
+          return null;
         }
-      } catch (e) {
-        console.error(`[monitor-fp] ${video.id}@${startSec}s: ${e.message.slice(0, 150)}`);
+      }));
+
+      // Phase 2: fingerprint sequentially (fpcalc uses spawnSync, blocks event loop)
+      for (const item of downloaded.filter(Boolean)) {
+        const { startSec, audioPath } = item;
+        try {
+          const { fingerprint: clipFp } = getFingerprintFromFile(audioPath);
+          try { fs.unlinkSync(audioPath); } catch {}
+          const hit = matchFingerprintToDangerSongs(clipFp, dangerSongsWithFp);
+          if (hit && !matchedIds.has(hit.song.id)) {
+            matchedIds.add(hit.song.id);
+            matches.push({ song: hit.song, atSec: startSec });
+            console.log(`[monitor-fp] ${video.id}: MATCH "${hit.song.title}" at ${startSec}s (BER=${hit.ber.toFixed(3)})`);
+          }
+        } catch (e) {
+          console.error(`[monitor-fp] ${video.id}@${startSec}s fingerprint: ${e.message.slice(0, 150)}`);
+        }
       }
     }
   } finally {
@@ -1174,6 +1192,17 @@ async function monitorUserChannel(userId, options = {}) {
         })
         .eq("user_id", userId).eq("scan_id", scanId).eq("video_id", video.id);
     }));
+
+    // Check if user clicked Stop — handleStopScan sets channel_scan_started_at to null
+    const { data: cancelCheck } = await supabase
+      .from("profiles")
+      .select("channel_scan_started_at")
+      .eq("id", userId)
+      .single();
+    if (cancelCheck?.channel_scan_started_at !== scanId) {
+      console.log(`[monitor] scan cancelled by user, stopping`);
+      break;
+    }
   }
 
     await supabase.from("profiles").update({ channel_last_scanned_at: new Date().toISOString(), channel_scan_started_at: null }).eq("id", userId);
