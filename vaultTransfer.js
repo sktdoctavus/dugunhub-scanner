@@ -201,20 +201,37 @@ async function runRealTransfer(supabase, item, workerId) {
       await log(supabase, item, "download", "info", `B2'den indirildi (${downloaded.size} bytes).`);
     } else {
       await setItemStatus(supabase, item, "downloading", REAL_STAGE_PROGRESS);
-      await log(supabase, item, "download", "info", `Worker "${workerId}" starting yt-dlp download.`);
+      await log(supabase, item, "download", "info", `Worker "${workerId}" starting yt-dlp download (bestvideo+bestaudio, no quality cap).`);
       try {
         downloaded = await downloadFullVideo(item.sourceUrl, tmpDir);
       } catch (e) {
         await failItem(supabase, item, "download", e.message);
         return;
       }
-      await log(supabase, item, "download", "info", `Downloaded ${downloaded.size} bytes (.${downloaded.ext}).`);
+      // yt-dlp gets the best version YouTube will actually serve — never the
+      // creator's true original upload master (YouTube re-encodes everything
+      // it hosts). If the disaster-recovery goal is the literal original
+      // file, that requires the creator's own Google Takeout export, not
+      // this pipeline — see google_takeout_import.
+      const formatSummary = (downloaded.selectedFormats || [])
+        .map((f) => `id=${f.formatId} ${f.width || "?"}x${f.height || "?"}@${f.fps || "?"}fps vcodec=${f.vcodec} acodec=${f.acodec} vbr=${f.vbr} abr=${f.abr} tbr=${f.tbr} range=${f.dynamicRange} ext=${f.ext}`)
+        .join(" | ");
+      await log(supabase, item, "download", "info",
+        `Downloaded ${downloaded.size} bytes (.${downloaded.ext}). Selected format(s) — ${formatSummary || "(format info unavailable)"}. ` +
+        `Merged=${(downloaded.selectedFormats || []).length > 1 ? "yes (separate video+audio muxed via ffmpeg, no re-encode)" : "no (single combined format)"}.`);
     }
 
     await setItemStatus(supabase, item, "validating", REAL_STAGE_PROGRESS);
+    let merged;
     try {
-      const { durationSec } = await validateVideoFile(downloaded.filePath);
-      await log(supabase, item, "validate", "info", `ffprobe OK — duration ~${Math.round(durationSec)}s.`);
+      merged = await validateVideoFile(downloaded.filePath);
+      const lowQualityNote = merged.height && merged.height <= 360
+        ? " NOTE: this is a low resolution — if YouTube genuinely has no higher quality available for this video, this is the true best-available, not a bug."
+        : "";
+      await log(supabase, item, "validate", "info",
+        `ffprobe OK — merged output: ${merged.width || "?"}x${merged.height || "?"}, codec=${merged.videoCodec || "?"}, ` +
+        `bitrate=${merged.bitrateBps ? Math.round(merged.bitrateBps / 1000) + "kbps" : "?"}, range=${merged.dynamicRange}, ` +
+        `duration=~${Math.round(merged.durationSec)}s.${lowQualityNote}`);
     } catch (e) {
       await failItem(supabase, item, "validate", e.message);
       return;
@@ -233,7 +250,9 @@ async function runRealTransfer(supabase, item, workerId) {
       }
 
       await setItemStatus(supabase, item, "uploading_stream", REAL_STAGE_PROGRESS);
-      await log(supabase, item, "upload", "info", "Bunny Stream'e yükleniyor.");
+      await log(supabase, item, "upload", "info",
+        `Bunny Stream'e yükleniyor — kaynak dosya: ${downloaded.filePath} (${downloaded.size} bytes, .${downloaded.ext}), ` +
+        `çözünürlük ${merged.width || "?"}x${merged.height || "?"}. Bu, yt-dlp'nin indirdiği aynı dosyadır (downscale yok).`);
 
       let bunnyResult;
       try {
@@ -288,8 +307,9 @@ async function runRealTransfer(supabase, item, workerId) {
       await setItemStatus(supabase, item, "uploading_archive", REAL_STAGE_PROGRESS);
       await log(supabase, item, "upload", "info", `B2'ye yükleniyor: ${originalKey}`);
 
+      const contentTypeForExt = { mp4: "video/mp4", mkv: "video/x-matroska", webm: "video/webm" };
       try {
-        await b2.uploadFile(downloaded.filePath, originalKey, downloaded.ext === "mp4" ? "video/mp4" : "application/octet-stream");
+        await b2.uploadFile(downloaded.filePath, originalKey, contentTypeForExt[downloaded.ext] || "application/octet-stream");
         await b2.uploadJson({
           youtubeVideoId: item.youtubeVideoId,
           youtubeChannelId: item.youtubeChannelId,
@@ -299,6 +319,15 @@ async function runRealTransfer(supabase, item, workerId) {
           sizeBytes: downloaded.size,
           checksumMd5: md5,
           originalKey,
+          selectedFormats: downloaded.selectedFormats || null,
+          mergedResolution: merged.width && merged.height ? `${merged.width}x${merged.height}` : null,
+          videoCodec: merged.videoCodec || null,
+          dynamicRange: merged.dynamicRange || null,
+          provenanceNote:
+            "This file is the best version yt-dlp could retrieve from YouTube's own processed/re-encoded formats — " +
+            "it is NOT the creator's original upload master (YouTube re-encodes everything it hosts, and does not expose " +
+            "the source master via any API). Recovering the literal original file requires the creator's own Google " +
+            "Takeout export (see the google_takeout_import path), not this pipeline.",
         }, metadataKey);
       } catch (e) {
         await failItem(supabase, item, "upload", `B2 upload failed: ${e.message}`);
@@ -340,7 +369,10 @@ async function runRealTransfer(supabase, item, workerId) {
     }
 
     await setItemStatus(supabase, item, "uploading_stream", REAL_STAGE_PROGRESS, archiveFields);
-    await log(supabase, item, "upload", "info", "Arşiv tamamlandı, şimdi Bunny Stream'e izlenebilir kopya yükleniyor.");
+    await log(supabase, item, "upload", "info",
+      `Arşiv tamamlandı, şimdi Bunny Stream'e izlenebilir kopya yükleniyor — kaynak dosya: ${downloaded.filePath} ` +
+      `(${downloaded.size} bytes, .${downloaded.ext}), çözünürlük ${merged.width || "?"}x${merged.height || "?"}. ` +
+      `Bu, B2'ye yüklenen aynı yüksek kaliteli dosyadır (downscale yok).`);
 
     let bunnyResult;
     try {
