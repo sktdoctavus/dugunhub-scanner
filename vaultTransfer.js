@@ -1,12 +1,14 @@
 // vaultTransfer.js — processes exactly one claimed Vault backup item per call,
 // either as a dry-run simulation or (when VAULT_BACKUP_DRY_RUN=false) as a real
-// yt-dlp download + Backblaze B2 upload. Called from vaultBackupWorker.js after
-// vault-backup-worker-tick has already claimed the item and moved it to "preparing".
+// yt-dlp download + Backblaze B2 archive upload + Bunny Stream playback upload.
+// Called from vaultBackupWorker.js after vault-backup-worker-tick has already
+// claimed the item and moved it to "preparing".
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { downloadFullVideo, validateVideoFile } = require("./vaultDownload");
 const b2 = require("./b2");
+const bunny = require("./bunny");
 
 const DRY_RUN_STAGE_PROGRESS = { preparing: 10, downloading: 35, uploading: 70, verifying: 90, completed: 100 };
 const REAL_STAGE_PROGRESS = {
@@ -14,8 +16,10 @@ const REAL_STAGE_PROGRESS = {
   downloading: 35,
   validating: 60,
   uploading_archive: 80,
+  uploading_stream: 90,
   completed: 100,
   ready_for_streaming_upload: 60,
+  bunny_retry_pending: 80,
   local_only_waiting: 0,
   failed: 0,
 };
@@ -25,7 +29,7 @@ const REAL_STAGE_PROGRESS = {
 // all done, regardless of which of these outcomes each one landed on.
 const TERMINAL_ITEM_STATUSES = [
   "completed", "failed", "cancelled", "unsupported",
-  "ready_for_streaming_upload", "local_only_waiting",
+  "ready_for_streaming_upload", "local_only_waiting", "bunny_retry_pending",
 ];
 
 function sleep(ms) {
@@ -75,8 +79,13 @@ async function refreshJobRollup(supabase, jobId) {
   if (autoDone) {
     completedAt = new Date().toISOString();
     const autoCompleted = autoRows.filter((r) => r.status === "completed").length;
+    const autoFailed = autoRows.filter((r) => r.status === "failed").length;
+    // A job is only "failed" when every automated item genuinely failed.
+    // Anything else terminal-but-not-completed (e.g. bunny_retry_pending —
+    // the B2 archive succeeded, only the Bunny playback copy didn't) counts
+    // as a partial success, not a failure.
     if (autoCompleted === autoRows.length) status = "completed";
-    else if (autoCompleted === 0) status = "failed";
+    else if (autoFailed === autoRows.length) status = "failed";
     else status = "completed_with_errors";
   }
 
@@ -121,6 +130,32 @@ async function failItem(supabase, item, stage, message) {
   await log(supabase, item, stage, "error", String(message).slice(0, 1000));
   await deleteQueueRow(supabase, item);
   await refreshJobRollup(supabase, item.jobId);
+}
+
+// Uploads to Bunny Stream while periodically writing bytes_transferred/
+// transfer_speed_bps to the item row (throttled to ~1 write/2s — the file's
+// 'data' events fire far more often than that and would otherwise spam the
+// DB). Shared by both vault_streaming and vault_archive so the progress-
+// reporting logic exists exactly once.
+async function uploadToBunnyWithProgress(supabase, item, filePath, title) {
+  let lastWrite = 0;
+  let lastBytes = 0;
+  let lastTime = Date.now();
+  const onProgress = (uploaded, total) => {
+    const now = Date.now();
+    if (now - lastWrite < 2000 && uploaded < total) return;
+    const elapsedSec = Math.max(0.001, (now - lastTime) / 1000);
+    const speed = Math.round((uploaded - lastBytes) / elapsedSec);
+    lastWrite = now;
+    lastBytes = uploaded;
+    lastTime = now;
+    supabase
+      .from("vault_backup_job_items")
+      .update({ bytes_transferred: uploaded, bytes_total: total, transfer_speed_bps: speed })
+      .eq("id", item.itemId)
+      .then(() => {}, () => {});
+  };
+  return bunny.uploadToBunnyStream(filePath, title, { onProgress });
 }
 
 // ---- Real transfer: one video, one attempt, no retries yet ----
@@ -168,11 +203,49 @@ async function runRealTransfer(supabase, item, workerId) {
     }
 
     if (item.storageMode === "vault_streaming") {
-      // Bunny/streaming upload isn't implemented yet — stop here on purpose.
-      // No bytes are kept anywhere; the temp file is deleted in `finally` below.
-      await setItemStatus(supabase, item, "ready_for_streaming_upload", REAL_STAGE_PROGRESS);
-      await log(supabase, item, "complete", "info",
-        "İndirme ve doğrulama tamamlandı — izlenebilir kopya yükleme bir sonraki aşamada (Bunny) yapılacak.");
+      if (!bunny.isConfigured()) {
+        // Bunny env vars aren't set on this deployment yet — degrade
+        // gracefully instead of failing the item outright.
+        await setItemStatus(supabase, item, "ready_for_streaming_upload", REAL_STAGE_PROGRESS);
+        await log(supabase, item, "complete", "info",
+          "Bunny Stream ortam değişkenleri ayarlanmamış — izlenebilir kopya yükleme atlandı (ready_for_streaming_upload).");
+        await deleteQueueRow(supabase, item);
+        await refreshJobRollup(supabase, item.jobId);
+        return;
+      }
+
+      await setItemStatus(supabase, item, "uploading_stream", REAL_STAGE_PROGRESS);
+      await log(supabase, item, "upload", "info", "Bunny Stream'e yükleniyor.");
+
+      let bunnyResult;
+      try {
+        bunnyResult = await uploadToBunnyWithProgress(supabase, item, downloaded.filePath, item.title || item.youtubeVideoId);
+      } catch (e) {
+        // No B2 copy exists for vault_streaming — a failed Bunny upload
+        // means nothing was preserved, so this is a genuine failure.
+        await failItem(supabase, item, "upload", `Bunny upload failed: ${e.message}`);
+        return;
+      }
+
+      await setItemStatus(supabase, item, "completed", REAL_STAGE_PROGRESS, {
+        bunny_video_guid: bunnyResult.guid,
+        bunny_embed_url: bunnyResult.embedUrl,
+        bunny_thumbnail_url: bunnyResult.thumbnailUrl,
+        bytes_total: bunnyResult.size,
+        bytes_transferred: bunnyResult.size,
+        completed_at: new Date().toISOString(),
+      });
+      await supabase
+        .from("vault_youtube_videos")
+        .update({
+          backup_status: "backed_up",
+          bunny_video_guid: bunnyResult.guid,
+          bunny_embed_url: bunnyResult.embedUrl,
+          bunny_thumbnail_url: bunnyResult.thumbnailUrl,
+        })
+        .eq("id", item.vaultVideoId);
+      await log(supabase, item, "complete", "info", `İzlenebilir kopya Bunny Stream'e yüklendi: ${bunnyResult.guid}.`);
+
       await deleteQueueRow(supabase, item);
       await refreshJobRollup(supabase, item.jobId);
       return;
@@ -217,15 +290,61 @@ async function runRealTransfer(supabase, item, workerId) {
       return;
     }
 
-    await setItemStatus(supabase, item, "completed", REAL_STAGE_PROGRESS, {
+    // The archive itself is now safe in B2 regardless of what happens next —
+    // every path below keeps these fields and flips backup_status.
+    const archiveFields = {
       storage_object_key: originalKey,
       checksum: md5,
       bytes_total: downloaded.size,
       bytes_transferred: downloaded.size,
+    };
+    await log(supabase, item, "upload", "info", `Arşive yüklendi ve doğrulandı: ${originalKey} (${downloaded.size} bytes).`);
+    await supabase.from("vault_youtube_videos").update({ backup_status: "backed_up" }).eq("id", item.vaultVideoId);
+
+    if (!bunny.isConfigured()) {
+      await setItemStatus(supabase, item, "completed", REAL_STAGE_PROGRESS, { ...archiveFields, completed_at: new Date().toISOString() });
+      await log(supabase, item, "complete", "info", "Bunny Stream ortam değişkenleri ayarlanmamış — yalnızca B2 arşivi tamamlandı.");
+      await deleteQueueRow(supabase, item);
+      await refreshJobRollup(supabase, item.jobId);
+      return;
+    }
+
+    await setItemStatus(supabase, item, "uploading_stream", REAL_STAGE_PROGRESS, archiveFields);
+    await log(supabase, item, "upload", "info", "Arşiv tamamlandı, şimdi Bunny Stream'e izlenebilir kopya yükleniyor.");
+
+    let bunnyResult;
+    try {
+      bunnyResult = await uploadToBunnyWithProgress(supabase, item, downloaded.filePath, item.title || item.youtubeVideoId);
+    } catch (e) {
+      // B2 archive already succeeded and is untouched — don't lose it or
+      // call this a failure. Mark the Bunny leg as needing a future retry.
+      console.error(`[vault-transfer] item ${item.itemId} Bunny upload failed after B2 archive succeeded: ${e.message}`);
+      await setItemStatus(supabase, item, "bunny_retry_pending", REAL_STAGE_PROGRESS, {
+        ...archiveFields,
+        last_error: `Arşiv (B2) başarılı, Bunny Stream yüklemesi başarısız: ${String(e.message).slice(0, 400)}`,
+      });
+      await log(supabase, item, "upload", "error", `Bunny upload failed, B2 archive preserved: ${String(e.message).slice(0, 1000)}`);
+      await deleteQueueRow(supabase, item);
+      await refreshJobRollup(supabase, item.jobId);
+      return;
+    }
+
+    await setItemStatus(supabase, item, "completed", REAL_STAGE_PROGRESS, {
+      ...archiveFields,
+      bunny_video_guid: bunnyResult.guid,
+      bunny_embed_url: bunnyResult.embedUrl,
+      bunny_thumbnail_url: bunnyResult.thumbnailUrl,
       completed_at: new Date().toISOString(),
     });
-    await supabase.from("vault_youtube_videos").update({ backup_status: "backed_up" }).eq("id", item.vaultVideoId);
-    await log(supabase, item, "complete", "info", `Arşive yüklendi ve doğrulandı: ${originalKey} (${downloaded.size} bytes).`);
+    await supabase
+      .from("vault_youtube_videos")
+      .update({
+        bunny_video_guid: bunnyResult.guid,
+        bunny_embed_url: bunnyResult.embedUrl,
+        bunny_thumbnail_url: bunnyResult.thumbnailUrl,
+      })
+      .eq("id", item.vaultVideoId);
+    await log(supabase, item, "complete", "info", `İzlenebilir kopya da Bunny Stream'e yüklendi: ${bunnyResult.guid}. Arşiv + oynatma tamamlandı.`);
 
     await deleteQueueRow(supabase, item);
     await refreshJobRollup(supabase, item.jobId);
