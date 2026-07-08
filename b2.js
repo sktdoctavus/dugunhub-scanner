@@ -1,7 +1,8 @@
 // b2.js — Backblaze B2 uploads via its S3-compatible API for Vault archive backups.
 // Bucket is private; this module never generates or returns a public/signed URL.
-const { S3Client, PutObjectCommand, HeadObjectCommand, DeleteObjectCommand } = require("@aws-sdk/client-s3");
+const { S3Client, PutObjectCommand, HeadObjectCommand, DeleteObjectCommand, GetObjectCommand } = require("@aws-sdk/client-s3");
 const fs = require("fs");
+const path = require("path");
 const crypto = require("crypto");
 
 function endpointUrl() {
@@ -93,4 +94,21 @@ async function deleteObject(key) {
   await client.send(new DeleteObjectCommand({ Bucket: process.env.BACKBLAZE_BUCKET, Key: key }));
 }
 
-module.exports = { uploadFile, uploadJson, verifyUpload, deleteObject, md5File };
+// Streams an already-archived original back down from B2 — used on retry so
+// a video whose B2 upload already succeeded (only a later step, like the
+// Bunny upload, failed) doesn't need to be re-fetched from YouTube.
+async function downloadFile(key, destPath) {
+  const client = getClient();
+  const res = await client.send(new GetObjectCommand({ Bucket: process.env.BACKBLAZE_BUCKET, Key: key }));
+  await new Promise((resolve, reject) => {
+    const writeStream = fs.createWriteStream(destPath);
+    res.Body.pipe(writeStream);
+    res.Body.on("error", reject);
+    writeStream.on("finish", resolve);
+    writeStream.on("error", reject);
+  });
+  const size = fs.statSync(destPath).size;
+  return { filePath: destPath, size, ext: path.extname(destPath).replace(".", "") };
+}
+
+module.exports = { uploadFile, uploadJson, verifyUpload, deleteObject, downloadFile, md5File };

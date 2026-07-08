@@ -181,17 +181,35 @@ async function runRealTransfer(supabase, item, workerId) {
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "vault-"));
   try {
-    await setItemStatus(supabase, item, "downloading", REAL_STAGE_PROGRESS);
-    await log(supabase, item, "download", "info", `Worker "${workerId}" starting yt-dlp download.`);
+    // Retry shortcut: this video already has a verified B2 archive from a
+    // prior attempt (only a later step, like the Bunny upload, failed) —
+    // reuse it instead of re-downloading from YouTube and re-uploading.
+    const reuseArchivedFile = item.storageMode === "vault_archive" && !!item.storageObjectKey;
 
     let downloaded;
-    try {
-      downloaded = await downloadFullVideo(item.sourceUrl, tmpDir);
-    } catch (e) {
-      await failItem(supabase, item, "download", e.message);
-      return;
+    if (reuseArchivedFile) {
+      await setItemStatus(supabase, item, "downloading", REAL_STAGE_PROGRESS);
+      await log(supabase, item, "download", "info",
+        `Yeniden deneme: B2 arşivi zaten mevcut (${item.storageObjectKey}) — YouTube'dan tekrar indirilmiyor, B2'den alınıyor.`);
+      const ext = item.storageObjectKey.split(".").pop() || "mp4";
+      try {
+        downloaded = await b2.downloadFile(item.storageObjectKey, path.join(tmpDir, `original.${ext}`));
+      } catch (e) {
+        await failItem(supabase, item, "download", `B2'den arşiv indirilemedi: ${e.message}`);
+        return;
+      }
+      await log(supabase, item, "download", "info", `B2'den indirildi (${downloaded.size} bytes).`);
+    } else {
+      await setItemStatus(supabase, item, "downloading", REAL_STAGE_PROGRESS);
+      await log(supabase, item, "download", "info", `Worker "${workerId}" starting yt-dlp download.`);
+      try {
+        downloaded = await downloadFullVideo(item.sourceUrl, tmpDir);
+      } catch (e) {
+        await failItem(supabase, item, "download", e.message);
+        return;
+      }
+      await log(supabase, item, "download", "info", `Downloaded ${downloaded.size} bytes (.${downloaded.ext}).`);
     }
-    await log(supabase, item, "download", "info", `Downloaded ${downloaded.size} bytes (.${downloaded.ext}).`);
 
     await setItemStatus(supabase, item, "validating", REAL_STAGE_PROGRESS);
     try {
@@ -252,53 +270,65 @@ async function runRealTransfer(supabase, item, workerId) {
     }
 
     // vault_archive from here on.
-    const md5 = await b2.md5File(downloaded.filePath);
-    const originalKey = `users/${item.userId}/youtube/${item.youtubeChannelId}/${item.youtubeVideoId}/original.${downloaded.ext}`;
-    const metadataKey = `users/${item.userId}/youtube/${item.youtubeChannelId}/${item.youtubeVideoId}/metadata.json`;
+    let archiveFields;
+    if (reuseArchivedFile) {
+      // Already uploaded and verified in a prior attempt — nothing to redo.
+      archiveFields = {
+        storage_object_key: item.storageObjectKey,
+        checksum: item.checksum,
+        bytes_total: item.bytesTotal,
+        bytes_transferred: item.bytesTotal,
+      };
+      await log(supabase, item, "upload", "info", "B2 arşivi zaten doğrulanmış — yeniden yüklenmiyor.");
+    } else {
+      const md5 = await b2.md5File(downloaded.filePath);
+      const originalKey = `users/${item.userId}/youtube/${item.youtubeChannelId}/${item.youtubeVideoId}/original.${downloaded.ext}`;
+      const metadataKey = `users/${item.userId}/youtube/${item.youtubeChannelId}/${item.youtubeVideoId}/metadata.json`;
 
-    await setItemStatus(supabase, item, "uploading_archive", REAL_STAGE_PROGRESS);
-    await log(supabase, item, "upload", "info", `B2'ye yükleniyor: ${originalKey}`);
+      await setItemStatus(supabase, item, "uploading_archive", REAL_STAGE_PROGRESS);
+      await log(supabase, item, "upload", "info", `B2'ye yükleniyor: ${originalKey}`);
 
-    try {
-      await b2.uploadFile(downloaded.filePath, originalKey, downloaded.ext === "mp4" ? "video/mp4" : "application/octet-stream");
-      await b2.uploadJson({
-        youtubeVideoId: item.youtubeVideoId,
-        youtubeChannelId: item.youtubeChannelId,
-        title: item.title,
-        sourceUrl: item.sourceUrl,
-        downloadedAt: new Date().toISOString(),
-        sizeBytes: downloaded.size,
-        checksumMd5: md5,
-        originalKey,
-      }, metadataKey);
-    } catch (e) {
-      await failItem(supabase, item, "upload", `B2 upload failed: ${e.message}`);
-      return;
+      try {
+        await b2.uploadFile(downloaded.filePath, originalKey, downloaded.ext === "mp4" ? "video/mp4" : "application/octet-stream");
+        await b2.uploadJson({
+          youtubeVideoId: item.youtubeVideoId,
+          youtubeChannelId: item.youtubeChannelId,
+          title: item.title,
+          sourceUrl: item.sourceUrl,
+          downloadedAt: new Date().toISOString(),
+          sizeBytes: downloaded.size,
+          checksumMd5: md5,
+          originalKey,
+        }, metadataKey);
+      } catch (e) {
+        await failItem(supabase, item, "upload", `B2 upload failed: ${e.message}`);
+        return;
+      }
+
+      let verification;
+      try {
+        verification = await b2.verifyUpload(originalKey, downloaded.size, md5);
+      } catch (e) {
+        await failItem(supabase, item, "upload", `B2 verification request failed: ${e.message}`);
+        return;
+      }
+      if (!verification.verified) {
+        await b2.deleteObject(originalKey).catch(() => {});
+        await failItem(supabase, item, "upload",
+          `B2 verification mismatch (sizeMatches=${verification.sizeMatches}, etag=${verification.etag}).`);
+        return;
+      }
+
+      // The archive itself is now safe in B2 regardless of what happens next.
+      archiveFields = {
+        storage_object_key: originalKey,
+        checksum: md5,
+        bytes_total: downloaded.size,
+        bytes_transferred: downloaded.size,
+      };
+      await log(supabase, item, "upload", "info", `Arşive yüklendi ve doğrulandı: ${originalKey} (${downloaded.size} bytes).`);
     }
 
-    let verification;
-    try {
-      verification = await b2.verifyUpload(originalKey, downloaded.size, md5);
-    } catch (e) {
-      await failItem(supabase, item, "upload", `B2 verification request failed: ${e.message}`);
-      return;
-    }
-    if (!verification.verified) {
-      await b2.deleteObject(originalKey).catch(() => {});
-      await failItem(supabase, item, "upload",
-        `B2 verification mismatch (sizeMatches=${verification.sizeMatches}, etag=${verification.etag}).`);
-      return;
-    }
-
-    // The archive itself is now safe in B2 regardless of what happens next —
-    // every path below keeps these fields and flips backup_status.
-    const archiveFields = {
-      storage_object_key: originalKey,
-      checksum: md5,
-      bytes_total: downloaded.size,
-      bytes_transferred: downloaded.size,
-    };
-    await log(supabase, item, "upload", "info", `Arşive yüklendi ve doğrulandı: ${originalKey} (${downloaded.size} bytes).`);
     await supabase.from("vault_youtube_videos").update({ backup_status: "backed_up" }).eq("id", item.vaultVideoId);
 
     if (!bunny.isConfigured()) {
