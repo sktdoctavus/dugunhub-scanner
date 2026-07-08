@@ -2,6 +2,7 @@ const express = require("express");
 const { processJob, resolveYouTubeUrl, fingerprintDangerSong, debugMatch, resolveChannelUrl, ytMetaScan, monitorUserChannel } = require("./scanner");
 const axios = require("axios");
 const { createClient } = require("@supabase/supabase-js");
+const { startVaultBackupPoller } = require("./vaultBackupWorker");
 
 const app = express();
 app.use(express.json());
@@ -198,4 +199,6 @@ app.listen(PORT, () => {
   console.log(`[config] YTDLP_PROXY set: ${!!process.env.YTDLP_PROXY} (${(process.env.YTDLP_PROXY || "").length} chars)`);
   console.log(`[config] YTDLP_COOKIES set: ${!!process.env.YTDLP_COOKIES} (${(process.env.YTDLP_COOKIES || "").length} chars)`);
   console.log(`[config] YTDLP_COOKIES_B64 set: ${!!process.env.YTDLP_COOKIES_B64} (${(process.env.YTDLP_COOKIES_B64 || "").length} chars)`);
+
+  startVaultBackupPoller();
 });
