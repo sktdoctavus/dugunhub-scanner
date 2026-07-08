@@ -1,6 +1,10 @@
 // vaultTransfer.js — processes exactly one claimed Vault backup item per call,
 // either as a dry-run simulation or (when VAULT_BACKUP_DRY_RUN=false) as a real
-// yt-dlp download + Backblaze B2 archive upload + Bunny Stream playback upload.
+// transfer. Four storage_mode outcomes (user-facing goal → technical mode):
+//   "Watch Online"                    -> vault_streaming          (Bunny only)
+//   "Protect Forever"                 -> vault_archive             (B2 only)
+//   "Watch Online + Protect Forever"  -> vault_archive_streaming  (B2 + Bunny)
+//   "Save Locally Only"               -> local_only     (no-op; needs Studio Agent)
 // Called from vaultBackupWorker.js after vault-backup-worker-tick has already
 // claimed the item and moved it to "preparing".
 const fs = require("fs");
@@ -161,15 +165,20 @@ async function uploadToBunnyWithProgress(supabase, item, filePath, title) {
 // ---- Real transfer: one video, one attempt, no retries yet ----
 async function runRealTransfer(supabase, item, workerId) {
   if (item.storageMode === "local_only") {
+    // "Save Locally Only" — downloading straight to the creator's own
+    // computer/NAS needs DugunHub Studio Agent (a local desktop app);
+    // Railway has no way to write to a user's local disk. Until that
+    // exists, this mode intentionally does nothing automated.
     await setItemStatus(supabase, item, "local_only_waiting", REAL_STAGE_PROGRESS, { skip_reason: "local_only" });
     await log(supabase, item, "skip", "info",
-      "Sadece yerel yedek seçildi — otomatik aktarım yapılmadı. Videoyu manuel olarak yerel diskinize indirip saklayın.");
+      "\"Sadece Yerel Kaydet\" seçildi — bu özellik DugunHub Studio Agent masaüstü uygulaması ile sunulacak, henüz kullanılamıyor. Otomatik aktarım yapılmadı.");
     await deleteQueueRow(supabase, item);
     await refreshJobRollup(supabase, item.jobId);
     return;
   }
 
-  if (item.storageMode !== "vault_streaming" && item.storageMode !== "vault_archive") {
+  const ARCHIVE_MODES = ["vault_archive", "vault_archive_streaming"];
+  if (item.storageMode !== "vault_streaming" && !ARCHIVE_MODES.includes(item.storageMode)) {
     await failItem(supabase, item, "prepare", `Unknown storage_mode: ${item.storageMode}`);
     return;
   }
@@ -184,7 +193,7 @@ async function runRealTransfer(supabase, item, workerId) {
     // Retry shortcut: this video already has a verified B2 archive from a
     // prior attempt (only a later step, like the Bunny upload, failed) —
     // reuse it instead of re-downloading from YouTube and re-uploading.
-    const reuseArchivedFile = item.storageMode === "vault_archive" && !!item.storageObjectKey;
+    const reuseArchivedFile = ARCHIVE_MODES.includes(item.storageMode) && !!item.storageObjectKey;
 
     let downloaded;
     if (reuseArchivedFile) {
@@ -360,6 +369,21 @@ async function runRealTransfer(supabase, item, workerId) {
 
     await supabase.from("vault_youtube_videos").update({ backup_status: "backed_up" }).eq("id", item.vaultVideoId);
 
+    // Plain "vault_archive" means B2-only by design (Protect Forever) — no
+    // Bunny upload is even attempted, unlike "vault_archive_streaming"
+    // (Watch Online + Protect Forever). A future "add a watchable copy"
+    // action on an already-archived item should reuse the same
+    // b2.downloadFile()-then-Bunny-upload path the retry shortcut already
+    // exercises above, rather than re-downloading from YouTube.
+    if (item.storageMode === "vault_archive") {
+      await setItemStatus(supabase, item, "completed", REAL_STAGE_PROGRESS, { ...archiveFields, completed_at: new Date().toISOString() });
+      await log(supabase, item, "complete", "info", "Arşiv tamamlandı (yalnızca yüksek kaliteli B2 kopyası — izlenebilir kopya istenmedi).");
+      await deleteQueueRow(supabase, item);
+      await refreshJobRollup(supabase, item.jobId);
+      return;
+    }
+
+    // item.storageMode === "vault_archive_streaming" from here on.
     if (!bunny.isConfigured()) {
       await setItemStatus(supabase, item, "completed", REAL_STAGE_PROGRESS, { ...archiveFields, completed_at: new Date().toISOString() });
       await log(supabase, item, "complete", "info", "Bunny Stream ortam değişkenleri ayarlanmamış — yalnızca B2 arşivi tamamlandı.");
