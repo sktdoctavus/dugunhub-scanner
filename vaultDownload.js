@@ -45,7 +45,9 @@ function writeCookiesFile() {
   }
 }
 
-const PLAYER_CLIENTS = "web,mweb,tv_embedded,ios,android";
+// tv_embedded removed 2026-07-09 — current yt-dlp (2026.07.04) logs
+// "Skipping unsupported client" for it on every request; it's dead weight.
+const PLAYER_CLIENTS = "web,mweb,ios,android";
 
 function baseClientArgs(cookiePath) {
   const args = [
