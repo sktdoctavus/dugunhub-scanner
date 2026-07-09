@@ -18,11 +18,17 @@ RUN curl -L https://github.com/acoustid/chromaprint/releases/download/v1.5.1/chr
     && chmod a+rx /usr/local/bin/fpcalc \
     && rm -rf /tmp/chromaprint-fpcalc-1.5.1-linux-x86_64
 
-# Download yt-dlp standalone binary (no pip/python3-pip needed)
-# cache-bust: 2026-05-13
+# Download yt-dlp standalone binary (no pip/python3-pip needed). yt-dlp ships
+# frequent point releases to keep up with YouTube's extraction changes — an
+# old pinned binary can silently lose access to higher-quality formats even
+# though the URL below always points at "latest", because Docker layer
+# caching reuses this RUN layer across builds until the cache-bust changes.
+# Bump the date below whenever you need to force a fresh download.
+# cache-bust: 2026-07-09
 RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
     -o /usr/local/bin/yt-dlp \
-    && chmod a+rx /usr/local/bin/yt-dlp
+    && chmod a+rx /usr/local/bin/yt-dlp \
+    && yt-dlp --version
 
 WORKDIR /app
 

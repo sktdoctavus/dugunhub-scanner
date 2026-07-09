@@ -36,6 +36,12 @@ const TERMINAL_ITEM_STATUSES = [
   "ready_for_streaming_upload", "local_only_waiting", "bunny_retry_pending",
 ];
 
+function formatToolingLine(tooling) {
+  if (!tooling) return "Tooling check unavailable.";
+  const part = (name, t) => `${name}=${t.available ? `OK(${t.version})` : `MISSING(${t.error})`}`;
+  return `Tooling — ${part("ffmpeg", tooling.ffmpeg)} ${part("ffprobe", tooling.ffprobe)} ${part("yt-dlp", tooling.ytDlp)}`;
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -214,9 +220,36 @@ async function runRealTransfer(supabase, item, workerId) {
       try {
         downloaded = await downloadFullVideo(item.sourceUrl, tmpDir);
       } catch (e) {
+        // Even a failed attempt carries tooling/preflight diagnostics —
+        // surface them so a failure is debuggable without a second attempt.
+        if (e.tooling) {
+          await log(supabase, item, "download", "error", formatToolingLine(e.tooling));
+        }
+        if (e.preflightSummary) {
+          await log(supabase, item, "download", "error", `Preflight formats before failure — ${e.preflightSummary.text}`);
+        } else if (e.preflight && !e.preflight.ok) {
+          await log(supabase, item, "download", "error", `Preflight format listing also failed: ${e.preflight.error}`);
+        }
+        if (e.safeCommand) {
+          await log(supabase, item, "download", "error", `Command: ${e.safeCommand}`);
+        }
         await failItem(supabase, item, "download", e.message);
         return;
       }
+
+      await log(supabase, item, "download", "info", formatToolingLine(downloaded.tooling));
+
+      if (downloaded.preflight?.ok) {
+        await log(supabase, item, "download", "info",
+          `Preflight (before download, same client/cookie/proxy config) — ${downloaded.preflightSummary.text}. ` +
+          `${downloaded.preflightSummary.videoFormatCount} video formats, ${downloaded.preflightSummary.audioFormatCount} audio formats seen.`);
+      } else {
+        await log(supabase, item, "download", "warning",
+          `Preflight format listing failed (informational only, real download still attempted): ${downloaded.preflight?.error || "unknown"}.`);
+      }
+
+      await log(supabase, item, "download", "info", `Command: ${downloaded.safeCommand}`);
+
       // yt-dlp gets the best version YouTube will actually serve — never the
       // creator's true original upload master (YouTube re-encodes everything
       // it hosts). If the disaster-recovery goal is the literal original
@@ -225,22 +258,36 @@ async function runRealTransfer(supabase, item, workerId) {
       const formatSummary = (downloaded.selectedFormats || [])
         .map((f) => `id=${f.formatId} ${f.width || "?"}x${f.height || "?"}@${f.fps || "?"}fps vcodec=${f.vcodec} acodec=${f.acodec} vbr=${f.vbr} abr=${f.abr} tbr=${f.tbr} range=${f.dynamicRange} ext=${f.ext}`)
         .join(" | ");
+      const bestSeen = downloaded.preflightSummary?.bestHeight;
+      const downloadedHeight = (downloaded.selectedFormats || []).map((f) => parseInt(f.height, 10) || 0).reduce((a, b) => Math.max(a, b), 0);
+      const mismatchNote = bestSeen && downloadedHeight && downloadedHeight < bestSeen
+        ? ` ⚠ MISMATCH: best available was ${bestSeen}p but selected format is only ${downloadedHeight}p — format selector or client restriction likely limiting quality.`
+        : "";
       await log(supabase, item, "download", "info",
         `Downloaded ${downloaded.size} bytes (.${downloaded.ext}). Selected format(s) — ${formatSummary || "(format info unavailable)"}. ` +
-        `Merged=${(downloaded.selectedFormats || []).length > 1 ? "yes (separate video+audio muxed via ffmpeg, no re-encode)" : "no (single combined format)"}.`);
+        `Merged=${downloaded.mergeHappened ? "yes (separate video+audio muxed via ffmpeg, no re-encode)" : "no (single combined format)"}.${mismatchNote}`);
     }
 
     await setItemStatus(supabase, item, "validating", REAL_STAGE_PROGRESS);
     let merged;
     try {
+      // This ffprobe result is the ground truth used to gate the upload
+      // below — it runs on the actual local file BEFORE any upload to B2 or
+      // Bunny starts, per the Vault acceptance test.
       merged = await validateVideoFile(downloaded.filePath);
-      const lowQualityNote = merged.height && merged.height <= 360
+      const bestSeenPreflight = downloaded.preflightSummary?.bestHeight;
+      const finalMismatchNote = bestSeenPreflight && merged.height && merged.height < bestSeenPreflight
+        ? ` ⚠ MISMATCH: preflight saw ${bestSeenPreflight}p available but the downloaded file is only ${merged.height}p.`
+        : bestSeenPreflight
+          ? ` (matches or exceeds the ${bestSeenPreflight}p seen in preflight.)`
+          : "";
+      const lowQualityNote = merged.height && merged.height <= 360 && !bestSeenPreflight
         ? " NOTE: this is a low resolution — if YouTube genuinely has no higher quality available for this video, this is the true best-available, not a bug."
         : "";
       await log(supabase, item, "validate", "info",
-        `ffprobe OK — merged output: ${merged.width || "?"}x${merged.height || "?"}, codec=${merged.videoCodec || "?"}, ` +
+        `ffprobe OK (verified on local file before any upload) — merged output: ${merged.width || "?"}x${merged.height || "?"}, codec=${merged.videoCodec || "?"}, ` +
         `bitrate=${merged.bitrateBps ? Math.round(merged.bitrateBps / 1000) + "kbps" : "?"}, range=${merged.dynamicRange}, ` +
-        `duration=~${Math.round(merged.durationSec)}s.${lowQualityNote}`);
+        `duration=~${Math.round(merged.durationSec)}s.${finalMismatchNote}${lowQualityNote}`);
     } catch (e) {
       await failItem(supabase, item, "validate", e.message);
       return;
